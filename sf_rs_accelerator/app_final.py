@@ -103,258 +103,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
-
-/* ── Reset & Base ── */
-html, body, [class*="css"] {
-    font-family: 'DM Sans', sans-serif;
-}
-
-/* ── Hide Streamlit default header/toolbar (white strip) ── */
-header[data-testid="stHeader"] {
-    display: none !important;
-    height: 0 !important;
-}
-#MainMenu, footer, header { visibility: hidden; height: 0; }
-.stAppDeployButton { display: none !important; }
-[data-testid="stToolbar"] { display: none !important; }
-.stApp > header { display: none !important; }
-
-/* ── Query migrator — match output code block height to input textarea ── */
-.qm-output-code pre {
-    height: 340px !important;
-    overflow-y: auto !important;
-    font-family: 'DM Mono', monospace !important;
-    font-size: 13px !important;
-}
-
-/* ── Background ── */
-.stApp {
-    background: #161b27;
-    color: #e8eaf0;
-}
-
-/* ── Sidebar ── */
-section[data-testid="stSidebar"] {
-    background: #1c2233;
-    border-right: 1px solid #2a3148;
-}
-section[data-testid="stSidebar"] * {
-    color: #d0d4e0 !important;
-}
-
-/* ── Header brand ── */
-.brand-header {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 8px 0 24px 0;
-    border-bottom: 1px solid #2a3148;
-    margin-bottom: 24px;
-}
-.brand-logo {
-    width: 36px; height: 36px;
-    background: linear-gradient(135deg, #5b8dee 0%, #a78bfa 100%);
-    border-radius: 10px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 18px;
-}
-.brand-name {
-    font-size: 20px;
-    font-weight: 600;
-    color: #f0f2ff !important;
-    letter-spacing: -0.3px;
-}
-.brand-sub {
-    font-size: 11px;
-    color: #6b7080 !important;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-}
-
-/* ── Section headers in sidebar ── */
-.sidebar-section {
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 1.2px;
-    text-transform: uppercase;
-    color: #4a5068 !important;
-    margin: 20px 0 10px 0;
-}
-
-/* ── Cards ── */
-.card {
-    background: #1c2233;
-    border: 1px solid #2a3148;
-    border-radius: 14px;
-    padding: 24px;
-    margin-bottom: 16px;
-}
-.card-title {
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.8px;
-    text-transform: uppercase;
-    color: #6b7080;
-    margin-bottom: 18px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-/* ── Status badges ── */
-.badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 12px;
-    border-radius: 20px;
-    font-size: 12px;
-    font-weight: 500;
-}
-.badge-connected   { background: #0f2e1e; color: #34d399; border: 1px solid #1a5c3a; }
-.badge-disconnected{ background: #2e1010; color: #f87171; border: 1px solid #7f1d1d; }
-.badge-pending     { background: #2a2010; color: #fbbf24; border: 1px solid #78350f; }
-
-/* ── Metric cards ── */
-.metric-row { display: flex; gap: 12px; margin-bottom: 16px; }
-.metric-card {
-    flex: 1;
-    background: #1c2233;
-    border: 1px solid #2a3148;
-    border-radius: 10px;
-    padding: 16px;
-    text-align: center;
-}
-.metric-value {
-    font-family: 'DM Mono', monospace;
-    font-size: 26px;
-    font-weight: 500;
-    color: #5b8dee;
-    line-height: 1.2;
-}
-.metric-label {
-    font-size: 11px;
-    color: #4a5068;
-    text-transform: uppercase;
-    letter-spacing: 0.8px;
-    margin-top: 4px;
-}
-
-/* ── Progress bar ── */
-.stProgress > div > div { background: linear-gradient(90deg, #5b8dee, #a78bfa); border-radius: 4px; }
-
-/* ── Buttons ── */
-.stButton > button {
-    background: linear-gradient(135deg, #5b8dee 0%, #7c6ee0 100%) !important;
-    color: #fff !important;
-    border: none !important;
-    border-radius: 10px !important;
-    padding: 10px 28px !important;
-    font-family: 'DM Sans', sans-serif !important;
-    font-weight: 500 !important;
-    font-size: 14px !important;
-    letter-spacing: 0.2px !important;
-    transition: opacity 0.2s !important;
-    width: 100%;
-}
-.stButton > button:hover { opacity: 0.85 !important; }
-
-/* ── Inputs ── */
-.stTextInput input, .stSelectbox > div > div, .stNumberInput input {
-    background: #131825 !important;
-    border: 1px solid #2a3148 !important;
-    border-radius: 8px !important;
-    color: #e8eaf0 !important;
-    font-family: 'DM Mono', monospace !important;
-    font-size: 13px !important;
-}
-
-/* ── Log box ── */
-.log-box {
-    background: #131825;
-    border: 1px solid #2a3148;
-    border-radius: 10px;
-    padding: 16px;
-    font-family: 'DM Mono', monospace;
-    font-size: 12px;
-    color: #6b7080;
-    height: 200px;
-    overflow-y: auto;
-    line-height: 1.8;
-}
-.log-ok   { color: #34d399; }
-.log-info { color: #5b8dee; }
-.log-warn { color: #fbbf24; }
-.log-err  { color: #f87171; }
-
-/* ── Pipeline flow diagram ── */
-.pipeline-flow {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0;
-    padding: 20px 0;
-    margin-bottom: 24px;
-}
-.flow-node {
-    text-align: center;
-    padding: 14px 22px;
-    border-radius: 12px;
-    min-width: 110px;
-}
-.flow-node-sf  { background: #162040; border: 1px solid #2a4080; }
-.flow-node-s3  { background: #1e1600; border: 1px solid #6b4800; }
-.flow-node-rs  { background: #102418; border: 1px solid #1a4a30; }
-.flow-node-icon { font-size: 24px; }
-.flow-node-name { font-size: 11px; font-weight: 600; letter-spacing: 0.5px; margin-top: 4px; color: #c8cad4; }
-.flow-arrow {
-    color: #3a3f55;
-    font-size: 20px;
-    padding: 0 8px;
-}
-.flow-arrow-active { color: #5b8dee; }
-
-/* ── Tabs ── */
-.stTabs [data-baseweb="tab-list"] {
-    background: #1c2233;
-    border-radius: 10px;
-    padding: 5px 6px;
-    gap: 2px;
-    border: 1px solid #2a3148;
-}
-.stTabs [data-baseweb="tab"] {
-    color: #8891a8 !important;
-    border-radius: 7px !important;
-    font-size: 13px !important;
-    font-weight: 500 !important;
-    padding: 7px 14px !important;
-    white-space: nowrap !important;
-}
-.stTabs [aria-selected="true"] {
-    background: #243050 !important;
-    color: #7aa8f5 !important;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.3) !important;
-}
-.stTabs [data-baseweb="tab"]:hover:not([aria-selected="true"]) {
-    background: #212840 !important;
-    color: #b0b8cc !important;
-}
-
-/* ── Divider ── */
-hr { border-color: #2a3148 !important; }
-
-/* ── Expander ── */
-.streamlit-expanderHeader {
-    background: #1c2233 !important;
-    border-radius: 8px !important;
-    color: #d0d4e0 !important;
-}
-</style>
-""", unsafe_allow_html=True)
+# Shared presentation layer; all workflow code below is unchanged.
+from ui_theme import apply_theme, render_theme_toggle
+apply_theme()
 
 
 # ── Session State Init ────────────────────────────────────────────────────────
@@ -1278,6 +1029,7 @@ _rs_cfg = {
 
 
 # ── Main area ─────────────────────────────────────────────────────────────────
+render_theme_toggle()
 st.markdown("## Pipeline Configuration")
 
 # ── Destination selector ──────────────────────────────────────────────────────
@@ -1359,22 +1111,52 @@ tab_discovery, tab1, tab2, tab_monitor, tab3, tab_validate, tab_ddl, tab_qm, tab
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_discovery:
     # ── Destination mode reminder ─────────────────────────────────────────────
+
     if _s3_only:
         st.markdown(
-            '<div style="background:#2a2010;border:1px solid #78350f;border-radius:10px;'
-            'padding:10px 16px;color:#fbbf24;font-size:13px;margin-bottom:12px">'
-            '◌ <b>S3-only mode</b> — the queue will export to S3 and stop there. '
-            'The Redshift COPY step will be skipped. '
-            'Change the <b>Pipeline Destination</b> dropdown above to enable full pipeline.</div>',
+            """
+            <div style="
+                background: var(--secondary-background-color);
+                border: 1px solid #D97706;
+                border-left: 4px solid #D97706;
+                border-radius: 8px;
+                padding: 12px 16px;
+                color: var(--text-color);
+                font-size: 14px;
+                line-height: 1.6;
+                margin-bottom: 12px;
+            ">
+                <strong style="color: #D97706;">S3-only mode</strong>
+                <span> — The queue will export to S3 and stop there.
+                The Redshift COPY step will be skipped.
+                Change the <strong>Pipeline Destination</strong>
+                dropdown above to enable the full pipeline.</span>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            '<div style="background:#0f2e1e;border:1px solid #1a5c3a;border-radius:10px;'
-            'padding:10px 16px;color:#34d399;font-size:13px;margin-bottom:12px">'
-            '● <b>Full pipeline mode</b> — queue will run Snowflake → S3 → Redshift COPY.</div>',
+            """
+            <div style="
+                background: var(--secondary-background-color);
+                border: 1px solid #16A34A;
+                border-left: 4px solid #16A34A;
+                border-radius: 8px;
+                padding: 12px 16px;
+                color: var(--text-color);
+                font-size: 14px;
+                line-height: 1.6;
+                margin-bottom: 12px;
+            ">
+                <strong style="color: #16A34A;">Full pipeline mode</strong>
+                <span> — The queue will run
+                Snowflake → S3 → Redshift COPY.</span>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
+
     # ── Partition / Filter configuration ─────────────────────────────────────
     st.markdown("---")
     st.markdown('<div class="card-title">⚙️ Export Options — Partitioning & Filtering</div>',
@@ -1514,19 +1296,49 @@ with tab_discovery:
 # ─────────────────────────────────────────────────────────────────────────────
 with tab1:
     # ── Destination mode banner ───────────────────────────────────────────────
+
     if _s3_only:
         st.markdown(
-            '<div style="background:#2a2010;border:1px solid #78350f;border-radius:10px;'
-            'padding:10px 16px;color:#fbbf24;font-size:13px;margin-bottom:16px">'
-            '◌ <b>S3-only mode active</b> — export will stop at S3. '
-            'The Redshift COPY step (Tab 2) and Job Queue Redshift leg will be skipped.</div>',
+            """
+            <div style="
+                background: var(--secondary-background-color);
+                border: 1px solid #D97706;
+                border-left: 4px solid #D97706;
+                border-radius: 8px;
+                padding: 12px 16px;
+                color: var(--text-color);
+                font-size: 14px;
+                line-height: 1.6;
+                margin-bottom: 12px;
+            ">
+                <strong style="color: #D97706;">S3-only mode</strong>
+                <span> — The queue will export to S3 and stop there.
+                The Redshift COPY step will be skipped.
+                Change the <strong>Pipeline Destination</strong>
+                dropdown above to enable the full pipeline.</span>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            '<div style="background:#0f2e1e;border:1px solid #1a5c3a;border-radius:10px;'
-            'padding:10px 16px;color:#34d399;font-size:13px;margin-bottom:16px">'
-            '● <b>Full pipeline mode</b> — after S3 export, the Job Queue will also run Redshift COPY.</div>',
+            """
+            <div style="
+                background: var(--secondary-background-color);
+                border: 1px solid #16A34A;
+                border-left: 4px solid #16A34A;
+                border-radius: 8px;
+                padding: 12px 16px;
+                color: var(--text-color);
+                font-size: 14px;
+                line-height: 1.6;
+                margin-bottom: 12px;
+            ">
+                <strong style="color: #16A34A;">Full pipeline mode</strong>
+                <span> — The queue will run
+                Snowflake → S3 → Redshift COPY.</span>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
 

@@ -1,0 +1,12 @@
+# Native canvas widgets use a known light base; the per-session CSS palette is
+# applied in ui_theme.py. Do not change global config from a session callback.
+[theme]
+base = "light"
+primaryColor = "#285eb2"
+backgroundColor = "#f4f6f9"
+secondaryBackgroundColor = "#eef2f7"
+textColor = "#243247"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"

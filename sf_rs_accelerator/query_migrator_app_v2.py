@@ -31,37 +31,10 @@ st.set_page_config(
 # ============================================================
 
 def main():
-    # Custom CSS for better styling
-    st.markdown("""
-    <style>
-    .stTextArea textarea {
-        font-family: 'Courier New', monospace;
-        font-size: 14px;
-    }
-    .highlight-box {
-        padding: 15px;
-        border-radius: 10px;
-        background-color: #f0f2f6;
-        border-left: 5px solid #0066cc;
-        margin: 10px 0;
-    }
-    .change-item {
-        padding: 8px 12px;
-        margin: 5px 0;
-        background-color: #e8f4f8;
-        border-radius: 5px;
-        border-left: 3px solid #28a745;
-    }
-    .warning-item {
-        padding: 8px 12px;
-        margin: 5px 0;
-        background-color: #fff3cd;
-        border-radius: 5px;
-        border-left: 3px solid #ffc107;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
+    from ui_theme import apply_theme, render_theme_toggle
+    apply_theme()
+    render_theme_toggle()
+
     # Header
     st.title("🔄 Snowflake to Redshift Migrator")
     st.markdown("Convert your Snowflake BI queries and stored procedures to Redshift-compatible SQL")
