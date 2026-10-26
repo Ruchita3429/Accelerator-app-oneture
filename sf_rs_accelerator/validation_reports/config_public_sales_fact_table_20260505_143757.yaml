@@ -1,0 +1,33 @@
+source_platform: Redshift
+target_platform: Snowflake
+output_directory_path: validation_reports
+max_threads: auto
+source_connection:
+  mode: credentials
+  host: defaultworkgroup.904188855316.ap-south-1.redshift-serverless.amazonaws.com
+  port: 5439
+  username: admin
+  password: Admin123
+  database: dev
+target_connection:
+  mode: default
+validation_configuration:
+  schema_validation: true
+  metrics_validation: true
+  row_validation: false
+  max_failed_rows_number: 100
+  exclude_metrics: false
+  apply_metric_column_modifier: false
+comparison_configuration:
+  tolerance: 0.01
+logging_configuration:
+  level: INFO
+  console_level: WARNING
+  file_level: DEBUG
+tables:
+- fully_qualified_name: public.sales_fact_table
+  use_column_selection_as_exclude_list: false
+  column_selection_list: []
+  target_database: DEMO_DB
+  target_schema: DEMO_SCHEMA
+  target_name: sales_fact_table

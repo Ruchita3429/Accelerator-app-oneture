@@ -1,0 +1,32 @@
+VALIDATION_TYPE,TABLE,COLUMN_VALIDATED,EVALUATION_CRITERIA,SOURCE_VALUE,SNOWFLAKE_VALUE,STATUS,COMMENTS
+SCHEMA,analytics_db.public.sales_fact_table,,COLUMN_COUNT,42,42,SUCCESS,
+SCHEMA,analytics_db.public.sales_fact_table,sale_id,DATA_TYPE,INTEGER,"NUMBER(38,0)",SUCCESS,Snowflake uses NUMBER for INTEGER columns
+SCHEMA,analytics_db.public.sales_fact_table,sale_date,DATA_TYPE,DATE,DATE,SUCCESS,
+SCHEMA,analytics_db.public.sales_fact_table,customer_id,DATA_TYPE,INTEGER,"NUMBER(38,0)",SUCCESS,
+SCHEMA,analytics_db.public.sales_fact_table,product_id,DATA_TYPE,INTEGER,"NUMBER(38,0)",SUCCESS,
+SCHEMA,analytics_db.public.sales_fact_table,region,DATA_TYPE,VARCHAR(50),TEXT,SUCCESS,Snowflake normalises VARCHAR to TEXT
+SCHEMA,analytics_db.public.sales_fact_table,sales_amount,DATA_TYPE,"DECIMAL(18,2)","NUMBER(18,2)",SUCCESS,
+SCHEMA,analytics_db.public.sales_fact_table,discount_pct,DATA_TYPE,FLOAT,FLOAT,SUCCESS,
+SCHEMA,analytics_db.public.sales_fact_table,is_returned,DATA_TYPE,BOOLEAN,BOOLEAN,SUCCESS,
+SCHEMA,analytics_db.public.sales_fact_table,created_at,DATA_TYPE,TIMESTAMP,TIMESTAMP_NTZ(9),WARNING,Snowflake stores as TIMESTAMP_NTZ; verify timezone handling
+SCHEMA,analytics_db.public.sales_fact_table,promo_code,DATA_TYPE,VARCHAR(20),TEXT,SUCCESS,
+SCHEMA,analytics_db.public.sales_fact_table,store_id,DATA_TYPE,SMALLINT,"NUMBER(38,0)",WARNING,SMALLINT precision differs; confirm no overflow
+METRICS,analytics_db.public.sales_fact_table,,ROW_COUNT,99999911,100000000,FAILURE,Row count mismatch of 89 rows; investigate missing records in Snowflake target
+METRICS,analytics_db.public.sales_fact_table,sale_id,NULL_COUNT,0,0,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,customer_id,NULL_COUNT,0,0,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,sales_amount,NULL_COUNT,142,142,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,discount_pct,NULL_COUNT,9823,9823,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,promo_code,NULL_COUNT,11204,11205,FAILURE,1 extra NULL in Snowflake target; possible ETL trim issue on load
+METRICS,analytics_db.public.sales_fact_table,sales_amount,SUM,4823917642.87,4823917642.87,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,discount_pct,AVG,0.1423,0.1423,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,sales_amount,MIN,0.01,0.01,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,sales_amount,MAX,99999.99,99999.99,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,sales_amount,AVG,261.14,261.14,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,sale_date,MIN,2019-01-01,2019-01-01,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,sale_date,MAX,2026-04-30,2026-04-30,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,region,DISTINCT_COUNT,12,12,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,channel,DISTINCT_COUNT,5,5,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,store_id,DISTINCT_COUNT,318,318,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,is_returned,SUM,203847,203847,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,created_at,MAX,2026-05-04 23:58:11,2026-05-04 23:58:11,SUCCESS,
+METRICS,analytics_db.public.sales_fact_table,sales_amount,STDDEV,187.4312,187.4318,FAILURE,Stddev deviation of 0.0006 exceeds tolerance 0.0001; minor floating-point rounding during migration

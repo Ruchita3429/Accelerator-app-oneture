@@ -1,0 +1,139 @@
+# BigQuery → S3 → Redshift Integration — Walkthrough
+
+## What Was Done
+
+The previous agent session (Sep 14) was purely Q&A. The code transfer had been started manually — `app_final.py` already had BigQuery references — but **none of the actual BigQuery module files had been copied** into the workspace. This session completed the transfer.
+
+---
+
+## Changes Made
+
+### Step 1 — Copied 9 new files from source folder
+
+These files were copied verbatim from `sf_rs_accelerator-20260902T162545Z-1-001 (1)`:
+
+| File | Purpose |
+|---|---|
+| [`pipeline_routes.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/pipeline_routes.py) | Route constants: `BQ_REDSHIFT`, `BQ_S3`, `is_bigquery()`, `s3_only()`, `source_name()`, `formats_for()` |
+| [`bigquery_connector.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/bigquery_connector.py) | BQ client creation, dataset listing, table discovery |
+| [`bigquery_migration.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/bigquery_migration.py) | `extract_to_s3()` + `load_to_redshift()` — the core data movers |
+| [`bigquery_ui.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/bigquery_ui.py) | Streamlit: connection panel, discovery, export queue builder |
+| [`bigquery_ddl_migrator.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/bigquery_ddl_migrator.py) | BigQuery DDL → Redshift DDL conversion engine |
+| [`bigquery_ddl_ui.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/bigquery_ddl_ui.py) | Streamlit UI for DDL migration + metadata tab |
+| [`bigquery_query_migrator.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/bigquery_query_migrator.py) | GoogleSQL → Redshift SQL query converter |
+| [`bigquery_query_ui.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/bigquery_query_ui.py) | Streamlit UI for query migration |
+| [`bigquery_health_ui.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/bigquery_health_ui.py) | BigQuery health check UI |
+
+---
+
+### Step 2 — Patched [`chunk_02_job_queue_engine.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/chunk_02_job_queue_engine.py)
+
+**3 changes made:**
+
+1. **Added guarded BQ imports** at the top:
+   ```python
+   try:
+       from pipeline_routes import is_bigquery, s3_only, source_name, formats_for
+       _BQ_ROUTES_AVAILABLE = True
+   except ImportError:
+       ...  # graceful fallback stubs
+   ```
+
+2. **Updated `run_migration()`** — added BigQuery route handling:
+   - Pre-flight validation (queue built for correct route, connection fingerprint, Iceberg guard for BQ→RS)
+   - BQ source branch in Phase 1: calls `bigquery_migration.extract_to_s3()`
+   - BQ source branch in Phase 2: calls `bigquery_migration.load_to_redshift()`
+   - Resume support for BQ jobs (idempotent Redshift Data API)
+
+3. **Updated `render_execution_controls()`** — added BigQuery awareness:
+   - Detects `_bq = is_bigquery(route)` and shows "BigQuery" as the source label
+   - Checks `bq_connected` instead of `sf_connected` / `db_connected` when BQ is active
+   - Reset logic clears BQ-specific idempotency keys (`run_id`, `phase`, `load_statement_id`, etc.)
+
+---
+
+### Step 3 — Fixed Pre-existing Syntax Errors in [`app_final.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/app_final.py)
+
+Two blocks had missing indentation (the body of a `with`/`if` statement was at the same level as the statement itself):
+
+| Location | Bug | Fix |
+|---|---|---|
+| Line ~2828 | `with ddl_sub_bulk:` body (353 lines) not indented | Added 4 spaces to lines 2829–3181 |
+| Line ~3334 | `if StoredProcedureMigrator is None:` body not indented | Fixed body + `else:` clause indent |
+
+---
+
+## Data Flow — BigQuery → S3 → Redshift
+
+```
+BigQuery (google-cloud-bigquery client)
+        │
+        │  1. SELECT * from `project.dataset.table`
+        │     using bigquery_connector.build_query()
+        │
+        ↓
+  Pandas / PyArrow DataFrame in Python memory
+        │
+        │  2. Serialize to chosen format:
+        │     Parquet → fastparquet / pyarrow
+        │     JSON    → df.to_json()
+        │     ORC     → pyarrow ORC writer
+        │     Iceberg → pyiceberg (S3-only route only)
+        │
+        ↓
+  bytes in memory (io.BytesIO buffer)
+        │
+        │  3. boto3 s3_client.put_object()
+        │
+        ↓
+  s3://bucket/prefix/dataset/table_timestamp.parquet
+        │
+        │  4. (S3 → Redshift route only)
+        │     Redshift Data API COPY command
+        │     via bigquery_migration.load_to_redshift()
+        │
+        ↓
+  Redshift table (rs_schema.rs_table)
+```
+
+**Key differences vs Snowflake route:**
+- BQ uses `FORMAT AS PARQUET/JSON/ORC` — no `FORMAT AS ICEBERG` in Redshift COPY
+- BQ uses Redshift Data API (async) with idempotency tokens — resumable by design
+- Iceberg format is only available on the BQ → S3 only route (not BQ → Redshift)
+
+---
+
+---
+
+## Recent Fixes Applied
+
+### 1. PyArrow C-Extension WDAC Shim ([`pyarrow_compat.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/pyarrow_compat.py))
+- **Issue**: Windows Defender Application Control (WDAC) blocked unsigned PyArrow `.pyd` DLLs (`_compute.pyd` and `_dataset.pyd`), crashing pandas upon import.
+- **Fix**: Implemented `pyarrow_compat.py` to stub blocked modules in `sys.modules` before `pandas` initializes. Imported at the top of [`app_final.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/app_final.py) and [`chunk_02_job_queue_engine.py`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/chunk_02_job_queue_engine.py).
+
+### 2. Module Shadowing & Signature Mismatch
+- **Issue**: Nested `sf_rs_accelerator/` folder was being injected into `sys.path`, causing an older `chunk_01_table_discovery.py` to be loaded without the `source_type` argument.
+- **Fix**: Corrected `sys.path` injection in `app_final.py` to target the app directory directly and added `**kwargs` backwards-compatibility fallback.
+
+### 3. BigQuery Health Check Assets ([`client_bigquery_health_check`](file:///c:/Users/himan/Downloads/sf_rs_accelerator-20260902T162545Z-1-001/sf_rs_accelerator/client_bigquery_health_check))
+- **Issue**: `FileNotFoundError: SQL_CONSOLE_QUICKSTART.md` when rendering `_bq_render_health()`.
+- **Fix**: Copied `client_bigquery_health_check` directory, SQL files, and download kit ZIPs into the root workspace directory.
+
+---
+
+## Verification Results
+
+| Check | Result |
+|---|---|
+| Syntax check — all files | ✅ PASS |
+| Import smoke test — all modules | ✅ PASS |
+| Streamlit Server (localhost:8501) | ✅ RUNNING (HTTP 200 OK) |
+| Health Check Kit File Access | ✅ PASS |
+| `_BQ_ROUTES_AVAILABLE = True` | ✅ PASS |
+
+---
+
+## App Status
+
+The Streamlit app is active and accessible at:
+👉 **`http://localhost:8501`**

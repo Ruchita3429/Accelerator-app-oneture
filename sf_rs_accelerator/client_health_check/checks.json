@@ -1,0 +1,523 @@
+{
+  "version": 1,
+  "source": "app_final.py health-check tab",
+  "checks": [
+    {
+      "id": "account_information",
+      "label": "Account Information",
+      "section": "account_overview",
+      "source_lines": [
+        2863
+      ],
+      "sql": "SELECT CURRENT_ACCOUNT() AS ACCOUNT_LOCATOR,\n       CURRENT_REGION() AS REGION,\n       CURRENT_VERSION() AS SNOWFLAKE_VERSION,\n       CURRENT_ACCOUNT_NAME() AS ACCOUNT_NAME",
+      "notes": [
+        "Account name/locator aliases corrected in this standalone export; dashboard aliases are reversed."
+      ]
+    },
+    {
+      "id": "object_counts",
+      "label": "Object Counts",
+      "section": "account_overview",
+      "source_lines": [
+        2870
+      ],
+      "sql": "SELECT\n  (SELECT COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.DATABASES) AS DATABASES,\n  (SELECT COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES)    AS TABLES,\n  (SELECT COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.VIEWS)     AS VIEWS,\n  (SELECT COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.USERS)     AS USERS,\n  (SELECT COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.ROLES)     AS ROLES",
+      "notes": [
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "login_failures",
+      "label": "Login Failures",
+      "section": "account_overview",
+      "source_lines": [
+        2879
+      ],
+      "sql": "SELECT USER_NAME, EVENT_TIMESTAMP, ERROR_MESSAGE\nFROM SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY\nWHERE IS_SUCCESS = 'NO'\nORDER BY EVENT_TIMESTAMP DESC",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan."
+      ]
+    },
+    {
+      "id": "cost_summary_daily",
+      "label": "Cost Summary (Daily)",
+      "section": "account_overview",
+      "source_lines": [
+        2885
+      ],
+      "sql": "SELECT DATE_TRUNC('DAY', START_TIME) AS DAY,\n       SUM(CREDITS_USED) AS TOTAL_CREDITS\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY\nGROUP BY 1 ORDER BY 1 DESC",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan."
+      ]
+    },
+    {
+      "id": "credits_by_feature",
+      "label": "Credits by Feature",
+      "section": "account_overview",
+      "source_lines": [
+        2891
+      ],
+      "sql": "SELECT SERVICE_TYPE, SUM(CREDITS_USED) AS CREDITS\nFROM SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY\nGROUP BY SERVICE_TYPE ORDER BY CREDITS DESC",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan."
+      ]
+    },
+    {
+      "id": "query_cost_breakdown",
+      "label": "Query Cost Breakdown",
+      "section": "account_overview",
+      "source_lines": [
+        2904
+      ],
+      "sql": "WITH account_info AS (\n    SELECT CURRENT_ACCOUNT() AS account_name, CURRENT_REGION() AS account_region\n),\nquery_usage AS (\n    SELECT QUERY_ID, USER_NAME, WAREHOUSE_NAME,\n           TOTAL_ELAPSED_TIME AS elapsed_ms, START_TIME\n    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\n    WHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\n),\nwarehouse_cost AS (\n    SELECT WAREHOUSE_NAME, START_TIME, CREDITS_USED\n    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY\n    WHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\n)\nSELECT q.QUERY_ID, q.USER_NAME, a.account_name,\n    CASE\n        WHEN a.account_region ILIKE '%AWS_US_EAST_1%' THEN 'US East (N. Virginia)'\n        WHEN a.account_region ILIKE '%AWS_US_WEST_2%' THEN 'US West (Oregon)'\n        WHEN a.account_region ILIKE '%AWS_EU_WEST_1%' THEN 'EU (Ireland)'\n        WHEN a.account_region ILIKE '%AZURE%' THEN 'Azure Region'\n        WHEN a.account_region ILIKE '%GCP%'   THEN 'GCP Region'\n        ELSE 'Other Region'\n    END AS region_name,\n    COALESCE(w.CREDITS_USED, 0) * 2.0 AS estimated_cost_usd,\n    q.elapsed_ms\nFROM query_usage q\nLEFT JOIN warehouse_cost w\n    ON q.WAREHOUSE_NAME = w.WAREHOUSE_NAME\n    AND DATE_TRUNC('HOUR', q.START_TIME) = DATE_TRUNC('HOUR', w.START_TIME)\nJOIN account_info a ON TRUE\nORDER BY q.START_TIME DESC LIMIT 100",
+      "notes": [
+        "Legacy approximation: each query receives its warehouse entire hourly credits multiplied by USD 2. This is NOT query-level cost; do not sum this column or treat it as a bill."
+      ]
+    },
+    {
+      "id": "warehouse_utilization",
+      "label": "Warehouse Utilization",
+      "section": "warehouse_health",
+      "source_lines": [
+        2943
+      ],
+      "sql": "SELECT WAREHOUSE_NAME,\n       AVG(AVG_RUNNING) AS AVG_LOAD,\n       MAX(AVG_RUNNING) AS PEAK_LOAD\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY\nGROUP BY 1",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan."
+      ]
+    },
+    {
+      "id": "queue_blocking_7_days",
+      "label": "Queue & Blocking (7 days)",
+      "section": "warehouse_health",
+      "source_lines": [
+        2951
+      ],
+      "sql": "SELECT WAREHOUSE_NAME,\n       ROUND(AVG(AVG_RUNNING), 3)     AS AVG_RUNNING,\n       ROUND(MAX(AVG_RUNNING), 3)     AS PEAK_RUNNING,\n       ROUND(AVG(AVG_QUEUED_LOAD), 3) AS AVG_QUEUE_LOAD,\n       ROUND(MAX(AVG_QUEUED_LOAD), 3) AS PEAK_QUEUE_LOAD\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\nGROUP BY WAREHOUSE_NAME",
+      "notes": []
+    },
+    {
+      "id": "utilization_status",
+      "label": "Utilization Status",
+      "section": "warehouse_health",
+      "source_lines": [
+        2962
+      ],
+      "sql": "SELECT WAREHOUSE_NAME,\n       ROUND(AVG(AVG_RUNNING), 3) AS AVG_RUNNING,\n       CASE WHEN AVG(AVG_RUNNING) < 0.2  THEN 'OVER-PROVISIONED'\n            WHEN AVG(AVG_RUNNING) <= 0.7 THEN 'OPTIMAL'\n            ELSE 'UNDER-PROVISIONED' END AS UTILIZATION_STATUS,\n       ROUND(MAX(AVG_QUEUED_LOAD), 3) AS PEAK_QUEUE,\n       CASE WHEN MAX(AVG_QUEUED_LOAD) > 0 THEN 'CONCURRENCY ISSUE'\n            ELSE 'NO QUEUE' END AS QUEUE_STATUS\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\nGROUP BY WAREHOUSE_NAME",
+      "notes": [
+        "Dashboard thresholds are heuristics. AVG_RUNNING measures query load, not CPU utilization or a validated warehouse sizing recommendation."
+      ]
+    },
+    {
+      "id": "idle_warehouse_credits",
+      "label": "Idle Warehouse Credits",
+      "section": "warehouse_health",
+      "source_lines": [
+        2975
+      ],
+      "sql": "SELECT WAREHOUSE_NAME,\n       SUM(CREDITS_USED) - SUM(CREDITS_USED_CLOUD_SERVICES) AS COMPUTE_CREDITS\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY\nGROUP BY 1",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan.",
+        "This query measures compute credits, not idle credits. Idle attribution is not calculated."
+      ]
+    },
+    {
+      "id": "slow_queries_last_7_days",
+      "label": "Slow Queries (Last 7 Days)",
+      "section": "query_performance",
+      "source_lines": [
+        2985
+      ],
+      "sql": "SELECT QUERY_ID, USER_NAME, WAREHOUSE_NAME, EXECUTION_STATUS,\n       TOTAL_ELAPSED_TIME/1000      AS EXEC_TIME_SEC,\n       COMPILATION_TIME/1000        AS COMPILATION_SEC,\n       BYTES_SCANNED/1024/1024/1024 AS GB_SCANNED\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\nORDER BY EXEC_TIME_SEC DESC LIMIT 50",
+      "notes": []
+    },
+    {
+      "id": "query_antipatterns",
+      "label": "Query Antipatterns",
+      "section": "query_performance",
+      "source_lines": [
+        2995
+      ],
+      "sql": "SELECT QUERY_ID, QUERY_TEXT\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE QUERY_TEXT ILIKE '%SELECT *%'\n   OR QUERY_TEXT ILIKE '%CROSS JOIN%'\nLIMIT 100",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan."
+      ]
+    },
+    {
+      "id": "query_spills",
+      "label": "Query Spills",
+      "section": "query_performance",
+      "source_lines": [
+        3002
+      ],
+      "sql": "SELECT QUERY_ID,\n       BYTES_SPILLED_TO_LOCAL_STORAGE,\n       BYTES_SPILLED_TO_REMOTE_STORAGE\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE BYTES_SPILLED_TO_REMOTE_STORAGE > 0\nORDER BY BYTES_SPILLED_TO_REMOTE_STORAGE DESC",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan."
+      ]
+    },
+    {
+      "id": "largest_tables",
+      "label": "Largest Tables",
+      "section": "table_schema",
+      "source_lines": [
+        3016
+      ],
+      "sql": "SELECT TABLE_SCHEMA, TABLE_NAME,\n       BYTES/1024/1024/1024 AS SIZE_GB\nFROM SNOWFLAKE.ACCOUNT_USAGE.TABLES\nORDER BY SIZE_GB DESC LIMIT 50",
+      "notes": [
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "table_growth",
+      "label": "Table Growth",
+      "section": "table_schema",
+      "source_lines": [
+        3023
+      ],
+      "sql": "SELECT TABLE_NAME,\n       DATE_TRUNC('DAY', CREATED) AS CREATED_DATE,\n       BYTES/1024/1024/1024 AS SIZE_GB\nFROM SNOWFLAKE.ACCOUNT_USAGE.TABLES\nORDER BY CREATED_DATE DESC",
+      "notes": [
+        "Current metadata snapshot, not measured growth over time.",
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "clustering_health",
+      "label": "Clustering Health",
+      "section": "table_schema",
+      "source_lines": [
+        3031
+      ],
+      "sql": "SELECT TABLE_NAME, CLUSTERING_KEY\nFROM SNOWFLAKE.ACCOUNT_USAGE.TABLES\nWHERE CLUSTERING_KEY IS NOT NULL",
+      "notes": [
+        "Lists configured clustering keys; does not measure clustering quality.",
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "poor_pruning_queries",
+      "label": "Poor Pruning Queries",
+      "section": "table_schema",
+      "source_lines": [
+        3036
+      ],
+      "sql": "SELECT QUERY_ID, PARTITIONS_SCANNED, PARTITIONS_TOTAL,\n       (PARTITIONS_SCANNED/NULLIF(PARTITIONS_TOTAL,0))*100 AS SCAN_PERCENT\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE PARTITIONS_SCANNED > 0\nORDER BY SCAN_PERCENT DESC",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan."
+      ]
+    },
+    {
+      "id": "schema_growth",
+      "label": "Schema Growth",
+      "section": "table_schema",
+      "source_lines": [
+        3043
+      ],
+      "sql": "SELECT TABLE_SCHEMA,\n       SUM(BYTES)/1024/1024/1024 AS SIZE_GB\nFROM SNOWFLAKE.ACCOUNT_USAGE.TABLES\nGROUP BY TABLE_SCHEMA ORDER BY SIZE_GB DESC",
+      "notes": [
+        "Current metadata snapshot, not measured growth over time.",
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "pipe_cost_7_days",
+      "label": "Pipe Cost (7 days)",
+      "section": "pipeline_health",
+      "source_lines": [
+        3055
+      ],
+      "sql": "SELECT PIPE_NAME, SUM(CREDITS_USED) AS TOTAL_CREDITS,\n       SUM(BYTES_INSERTED)/1024/1024/1024 AS GB_INSERTED\nFROM SNOWFLAKE.ACCOUNT_USAGE.PIPE_USAGE_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\nGROUP BY PIPE_NAME ORDER BY TOTAL_CREDITS DESC",
+      "notes": []
+    },
+    {
+      "id": "pipe_small_files",
+      "label": "Pipe Small Files",
+      "section": "pipeline_health",
+      "source_lines": [
+        3063
+      ],
+      "sql": "SELECT PIPE_NAME,\n       AVG(BYTES_INSERTED/NULLIF(FILES_INSERTED,0)) AS AVG_FILE_SIZE_BYTES,\n       SUM(FILES_INSERTED) AS TOTAL_FILES\nFROM SNOWFLAKE.ACCOUNT_USAGE.PIPE_USAGE_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\nGROUP BY PIPE_NAME\nHAVING AVG_FILE_SIZE_BYTES < 10*1024*1024",
+      "notes": [
+        "Only pipes with visible usage history are represented; absence is not proof of health. Names can repeat across schemas."
+      ]
+    },
+    {
+      "id": "pipe_trend",
+      "label": "Pipe Trend",
+      "section": "pipeline_health",
+      "source_lines": [
+        3073
+      ],
+      "sql": "SELECT PIPE_NAME,\n       DATE_TRUNC('HOUR', START_TIME) AS HOUR,\n       SUM(BYTES_INSERTED)/1024/1024/1024 AS GB_LOADED\nFROM SNOWFLAKE.ACCOUNT_USAGE.PIPE_USAGE_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\nGROUP BY PIPE_NAME, HOUR",
+      "notes": []
+    },
+    {
+      "id": "idle_pipes",
+      "label": "Idle Pipes",
+      "section": "pipeline_health",
+      "source_lines": [
+        3081,
+        3099
+      ],
+      "sql": "SELECT PIPE_NAME, MAX(END_TIME) AS LAST_LOAD_TIME\nFROM SNOWFLAKE.ACCOUNT_USAGE.PIPE_USAGE_HISTORY\nGROUP BY PIPE_NAME\nHAVING LAST_LOAD_TIME < DATEADD(DAY, -1, CURRENT_TIMESTAMP())",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan.",
+        "Only pipes with visible usage history are represented; absence is not proof of health. Names can repeat across schemas."
+      ]
+    },
+    {
+      "id": "unused_users_30_days",
+      "label": "Unused Users (30+ days)",
+      "section": "security_rbac",
+      "source_lines": [
+        3093
+      ],
+      "sql": "SELECT NAME, LAST_SUCCESS_LOGIN\nFROM SNOWFLAKE.ACCOUNT_USAGE.USERS\nWHERE LAST_SUCCESS_LOGIN < DATEADD(DAY, -30, CURRENT_TIMESTAMP())",
+      "notes": [
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "stored_procedure_failures",
+      "label": "Stored Procedure Failures",
+      "section": "security_rbac",
+      "source_lines": [
+        3106
+      ],
+      "sql": "SELECT QUERY_ID, ERROR_MESSAGE\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE ERROR_MESSAGE IS NOT NULL AND QUERY_TYPE = 'CALL'",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan."
+      ]
+    },
+    {
+      "id": "data_staleness_24_hours",
+      "label": "Data Staleness (24+ hours)",
+      "section": "security_rbac",
+      "source_lines": [
+        3111
+      ],
+      "sql": "SELECT TABLE_NAME, MAX(LAST_ALTERED) AS LAST_UPDATED\nFROM SNOWFLAKE.ACCOUNT_USAGE.TABLES\nGROUP BY TABLE_NAME\nHAVING LAST_UPDATED < DATEADD(HOUR, -24, CURRENT_TIMESTAMP())",
+      "notes": [
+        "LAST_ALTERED includes metadata/background changes; this is not proof of data freshness. Legacy query groups by table name only, which can combine same-named tables across schemas.",
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "resource_monitors",
+      "label": "Resource Monitors",
+      "section": "security_rbac",
+      "source_lines": [
+        3117
+      ],
+      "sql": "SHOW RESOURCE MONITORS",
+      "notes": []
+    },
+    {
+      "id": "total_credits_7d",
+      "label": "Total Credits 7D",
+      "section": "executive_insights",
+      "source_lines": [
+        3154
+      ],
+      "sql": "SELECT ROUND(SUM(CREDITS_USED), 2)\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())",
+      "notes": []
+    },
+    {
+      "id": "total_credits_30d",
+      "label": "Total Credits 30D",
+      "section": "executive_insights",
+      "source_lines": [
+        3161
+      ],
+      "sql": "SELECT ROUND(SUM(CREDITS_USED), 2)\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -30, CURRENT_TIMESTAMP())",
+      "notes": []
+    },
+    {
+      "id": "over_prov_count",
+      "label": "Over Prov Count",
+      "section": "executive_insights",
+      "source_lines": [
+        3169
+      ],
+      "sql": "SELECT COUNT(*)\nFROM (\n    SELECT WAREHOUSE_NAME, AVG(AVG_RUNNING) AS AVG_RUN\n    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY\n    WHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\n    GROUP BY WAREHOUSE_NAME\n    HAVING AVG_RUN < 0.2\n)",
+      "notes": [
+        "Dashboard thresholds are heuristics. AVG_RUNNING measures query load, not CPU utilization or a validated warehouse sizing recommendation."
+      ]
+    },
+    {
+      "id": "under_prov_count",
+      "label": "Under Prov Count",
+      "section": "executive_insights",
+      "source_lines": [
+        3180
+      ],
+      "sql": "SELECT COUNT(*)\nFROM (\n    SELECT WAREHOUSE_NAME, AVG(AVG_RUNNING) AS AVG_RUN\n    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY\n    WHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\n    GROUP BY WAREHOUSE_NAME\n    HAVING AVG_RUN > 0.7\n)",
+      "notes": [
+        "Dashboard thresholds are heuristics. AVG_RUNNING measures query load, not CPU utilization or a validated warehouse sizing recommendation."
+      ]
+    },
+    {
+      "id": "wh_queue_issues",
+      "label": "Wh Queue Issues",
+      "section": "executive_insights",
+      "source_lines": [
+        3191
+      ],
+      "sql": "SELECT COUNT(*)\nFROM (\n    SELECT WAREHOUSE_NAME\n    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY\n    WHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\n    GROUP BY WAREHOUSE_NAME\n    HAVING MAX(AVG_QUEUED_LOAD) > 0.5\n)",
+      "notes": []
+    },
+    {
+      "id": "slow_query_count",
+      "label": "Slow Query Count",
+      "section": "executive_insights",
+      "source_lines": [
+        3203
+      ],
+      "sql": "SELECT COUNT(*)\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\n  AND TOTAL_ELAPSED_TIME > 300000",
+      "notes": []
+    },
+    {
+      "id": "spill_count",
+      "label": "Spill Count",
+      "section": "executive_insights",
+      "source_lines": [
+        3210
+      ],
+      "sql": "SELECT COUNT(*)\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE BYTES_SPILLED_TO_REMOTE_STORAGE > 0\n  AND START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())",
+      "notes": []
+    },
+    {
+      "id": "antipattern_count",
+      "label": "Antipattern Count",
+      "section": "executive_insights",
+      "source_lines": [
+        3217
+      ],
+      "sql": "SELECT COUNT(*)\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\n  AND (QUERY_TEXT ILIKE '%SELECT *%' OR QUERY_TEXT ILIKE '%CROSS JOIN%')",
+      "notes": []
+    },
+    {
+      "id": "unused_users",
+      "label": "Unused Users",
+      "section": "executive_insights",
+      "source_lines": [
+        3225
+      ],
+      "sql": "SELECT COUNT(*)\nFROM SNOWFLAKE.ACCOUNT_USAGE.USERS\nWHERE LAST_SUCCESS_LOGIN < DATEADD(DAY, -30, CURRENT_TIMESTAMP())\n   OR LAST_SUCCESS_LOGIN IS NULL",
+      "notes": [
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "login_failures_7d",
+      "label": "Login Failures 7D",
+      "section": "executive_insights",
+      "source_lines": [
+        3232
+      ],
+      "sql": "SELECT COUNT(*)\nFROM SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY\nWHERE IS_SUCCESS = 'NO'\n  AND EVENT_TIMESTAMP >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())",
+      "notes": []
+    },
+    {
+      "id": "sp_failures",
+      "label": "Sp Failures",
+      "section": "executive_insights",
+      "source_lines": [
+        3239
+      ],
+      "sql": "SELECT COUNT(*)\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE ERROR_MESSAGE IS NOT NULL AND QUERY_TYPE = 'CALL'\n  AND START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())",
+      "notes": []
+    },
+    {
+      "id": "total_tables",
+      "label": "Total Tables",
+      "section": "executive_insights",
+      "source_lines": [
+        3247
+      ],
+      "sql": "SELECT COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES",
+      "notes": [
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "stale_tables",
+      "label": "Stale Tables",
+      "section": "executive_insights",
+      "source_lines": [
+        3251
+      ],
+      "sql": "SELECT COUNT(*)\nFROM (\n    SELECT TABLE_NAME, MAX(LAST_ALTERED) AS LAST_UPDATED\n    FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES\n    GROUP BY TABLE_NAME\n    HAVING LAST_UPDATED < DATEADD(HOUR, -72, CURRENT_TIMESTAMP())\n)",
+      "notes": [
+        "LAST_ALTERED includes metadata/background changes; this is not proof of data freshness. Legacy query groups by table name only, which can combine same-named tables across schemas.",
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "clustered_tables",
+      "label": "Clustered Tables",
+      "section": "executive_insights",
+      "source_lines": [
+        3261
+      ],
+      "sql": "SELECT COUNT(*)\nFROM SNOWFLAKE.ACCOUNT_USAGE.TABLES\nWHERE CLUSTERING_KEY IS NOT NULL",
+      "notes": [
+        "Preserves dashboard metadata filters; deleted objects may be included when the view retains them."
+      ]
+    },
+    {
+      "id": "idle_pipes_count",
+      "label": "Idle Pipes Count (7+ days)",
+      "section": "executive_insights",
+      "source_lines": [
+        3268
+      ],
+      "sql": "SELECT COUNT(*)\nFROM (\n    SELECT PIPE_NAME, MAX(END_TIME) AS LAST_LOAD\n    FROM SNOWFLAKE.ACCOUNT_USAGE.PIPE_USAGE_HISTORY\n    GROUP BY PIPE_NAME\n    HAVING LAST_LOAD < DATEADD(DAY, -7, CURRENT_TIMESTAMP())\n)",
+      "notes": [
+        "Uses the available Account Usage history, without a reporting-window filter. The row cap limits output, not the scan.",
+        "Only pipes with visible usage history are represented; absence is not proof of health. Names can repeat across schemas."
+      ]
+    },
+    {
+      "id": "small_file_pipes",
+      "label": "Small File Pipes",
+      "section": "executive_insights",
+      "source_lines": [
+        3278
+      ],
+      "sql": "SELECT COUNT(*)\nFROM (\n    SELECT PIPE_NAME,\n           AVG(BYTES_INSERTED / NULLIF(FILES_INSERTED, 0)) AS AVG_FILE_SIZE\n    FROM SNOWFLAKE.ACCOUNT_USAGE.PIPE_USAGE_HISTORY\n    WHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\n    GROUP BY PIPE_NAME\n    HAVING AVG_FILE_SIZE < 1024 * 1024\n)",
+      "notes": [
+        "Only pipes with visible usage history are represented; absence is not proof of health. Names can repeat across schemas."
+      ]
+    },
+    {
+      "id": "df_top_wh",
+      "label": "Top Wh",
+      "section": "executive_insights",
+      "source_lines": [
+        3291
+      ],
+      "sql": "SELECT WAREHOUSE_NAME, ROUND(SUM(CREDITS_USED), 2) AS CREDITS\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\nGROUP BY WAREHOUSE_NAME ORDER BY CREDITS DESC LIMIT 5",
+      "notes": []
+    },
+    {
+      "id": "df_daily_spend",
+      "label": "Daily Spend",
+      "section": "executive_insights",
+      "source_lines": [
+        3299
+      ],
+      "sql": "SELECT DATE_TRUNC('DAY', START_TIME) AS DAY,\n       ROUND(SUM(CREDITS_USED), 2) AS CREDITS\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\nGROUP BY 1 ORDER BY 1 ASC",
+      "notes": []
+    },
+    {
+      "id": "df_top_users",
+      "label": "Top Users",
+      "section": "executive_insights",
+      "source_lines": [
+        3308
+      ],
+      "sql": "SELECT USER_NAME, COUNT(*) AS QUERY_COUNT,\n       ROUND(SUM(TOTAL_ELAPSED_TIME)/1000/60, 1) AS TOTAL_EXEC_MIN\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE START_TIME >= DATEADD(DAY, -7, CURRENT_TIMESTAMP())\nGROUP BY USER_NAME ORDER BY TOTAL_EXEC_MIN DESC LIMIT 8",
+      "notes": []
+    }
+  ]
+}
