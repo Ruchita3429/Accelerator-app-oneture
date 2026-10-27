@@ -5,6 +5,7 @@ import hashlib
 import json
 
 import streamlit as st
+from ui_theme import tab_loading
 
 from bigquery_ddl_migrator import BigQueryDDLMigrator, validate_redshift_ddl
 
@@ -239,7 +240,7 @@ def render_ddl_migrator():
     st.caption("Convert flat BigQuery CREATE TABLE definitions to Redshift DDL. A Redshift connection is not required.")
     st.info("The generated schema matches the scalar types supported by this POC's BigQuery → Parquet → Redshift path. Nested/repeated fields, BIGNUMERIC, CTAS, replacement DDL and table constraints are reported for manual design.")
     paste, metadata = st.tabs(["Paste or upload DDL", "Connected BigQuery tables"])
-    with paste:
+    with paste, tab_loading():
         _paste_tab()
-    with metadata:
+    with metadata, tab_loading():
         _metadata_tab()

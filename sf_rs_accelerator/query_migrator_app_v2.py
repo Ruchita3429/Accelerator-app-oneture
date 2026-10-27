@@ -31,7 +31,7 @@ st.set_page_config(
 # ============================================================
 
 def main():
-    from ui_theme import apply_theme, render_theme_toggle
+    from ui_theme import apply_theme, render_theme_toggle, tab_loading
     apply_theme()
     render_theme_toggle()
 
@@ -46,7 +46,7 @@ def main():
     # ============================================================
     # QUERY MIGRATION TAB
     # ============================================================
-    with tab_query:
+    with tab_query, tab_loading():
         st.subheader("Query Migration")
         st.markdown("Convert Snowflake SELECT queries to Redshift-compatible syntax")
         
@@ -124,7 +124,7 @@ GROUP BY customer_id, region""",
     # ============================================================
     # STORED PROCEDURE MIGRATION TAB
     # ============================================================
-    with tab_procedure:
+    with tab_procedure, tab_loading():
         st.subheader("Stored Procedure Migration")
         st.markdown("Convert Snowflake stored procedures to Redshift-compatible format")
         

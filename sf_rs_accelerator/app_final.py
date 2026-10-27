@@ -19,6 +19,15 @@ _app_dir = _os.path.dirname(_os.path.abspath(__file__))
 if _app_dir not in sys.path:
     sys.path.insert(0, _app_dir)
 
+# A running Streamlit server can retain the pre-redesign presentation module
+# after the entry script changes. Refresh only that outdated module, before
+# dependent UI modules import its newly added helpers. Session state is untouched.
+import importlib
+import ui_theme as _ui_theme
+if not all(hasattr(_ui_theme, name) for name in
+           ("apply_theme", "render_theme_toggle", "brand_image", "tab_loading")):
+    importlib.reload(_ui_theme)
+
 try:
     from bigquery_connector   import create_client as _bq_create_client, list_datasets as _bq_list_datasets, discover_tables as _bq_discover_tables
     from bigquery_ddl_ui      import render_ddl_migrator as _bq_render_ddl
@@ -104,7 +113,7 @@ st.set_page_config(
 )
 
 # Shared presentation layer; all workflow code below is unchanged.
-from ui_theme import apply_theme, render_theme_toggle
+from ui_theme import apply_theme, render_theme_toggle, brand_image, tab_loading
 apply_theme()
 
 
@@ -714,11 +723,35 @@ def get_redshift_tables(cfg, schema, _raise=False):
     return None
 
 
+# ── Brand marks ───────────────────────────────────────────────────────────────
+_BRAND_MARKS = {
+    "databridge": '<path d="M3 19h18M5 19V9l7-5 7 5v10M8 19v-5h8v5M5 10h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
+    "snowflake": '<path d="M12 2v20M3.34 7l17.32 10M3.34 17 20.66 7M8 4l4 4 4-4M8 20l4-4 4 4M3 11l5 1-1 5M21 13l-5-1 1-5M3 13l5-1-1-5M21 11l-5 1 1 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>',
+    "databricks": '<path d="M.95 14.184 12 20.403l9.919-5.55v2.21L12 22.662l-10.484-5.96-.565.308v.77L12 24l11.05-6.218v-4.317l-.515-.309L12 19.118l-9.867-5.653v-2.21L12 16.805l11.05-6.218V6.32l-.515-.308L12 11.974 2.647 6.681 12 1.388l7.76 4.368.668-.411v-.566L12 0 .95 6.27v.72L12 13.207l9.919-5.55v2.26L12 15.52 1.516 9.56l-.565.308Z"/>',
+    "bigquery": '<path d="M4 3h5v18H4zM10 3h5v18h-5zM16 3h4v18h-4z"/>',
+    "s3": '<path d="M4 7h16l-1.2 13H5.2L4 7Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M7 4c3-2 7-2 10 0M8 13c2 1 6 1 8 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="m15 11 2 2-2 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>',
+    "redshift": '<ellipse cx="12" cy="5" rx="8" ry="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 5v13c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11c0 1.7 3.6 3 8 3s8-1.3 8-3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 8h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+}
+
+
+def _brand_icon(name):
+    """Return a supplied asset or a dimensioned inline SVG brand mark."""
+    image = brand_image(name)
+    if image is not None:
+        return image
+    return (
+        f'<svg class="brand-icon brand-icon-{name}" viewBox="0 0 24 24" '
+        f'width="18" height="18" fill="currentColor" '
+        f'style="max-width:28px;max-height:28px" '
+        f'aria-hidden="true">{_BRAND_MARKS[name]}</svg>'
+    )
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("""
+    st.markdown(f"""
     <div class="brand-header">
-        <div class="brand-logo">🔀</div>
+        <div class="brand-logo">{_brand_icon("databridge")}</div>
         <div>
             <div class="brand-name">DataBridge</div>
             <div class="brand-sub">Pipeline Studio</div>
@@ -757,7 +790,7 @@ with st.sidebar:
 
     # ── SNOWFLAKE (shown only when source = Snowflake) ────────────────────────
     if _source_type == "Snowflake":
-        st.markdown('<div class="sidebar-section">❄️ &nbsp;Snowflake</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sidebar-section">{_brand_icon("snowflake")}&nbsp;Snowflake</div>', unsafe_allow_html=True)
         sf_account  = st.text_input("Account",   placeholder="xyz.us-east-1", key="sf_account")
         sf_user     = st.text_input("User",       placeholder="data_user",     key="sf_user")
         sf_password = st.text_input("Password",   type="password",             key="sf_password")
@@ -798,7 +831,7 @@ with st.sidebar:
 
     # ── DATABRICKS (shown only when source = Databricks) ─────────────────────
     elif _source_type == "Databricks":
-        st.markdown('<div class="sidebar-section">🟠 &nbsp;Databricks</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sidebar-section">{_brand_icon("databricks")}&nbsp;Databricks</div>', unsafe_allow_html=True)
         db_host      = st.text_input("Workspace Host",  placeholder="adb-123.azuredatabricks.net", key="db_host", help="Databricks host (protocol https:// is automatically stripped)")
         db_http_path = st.text_input("HTTP Path",       placeholder="/sql/1.0/warehouses/abc123",  key="db_http_path", help="SQL Warehouse HTTP Path")
         db_token     = st.text_input("Access Token",    type="password",                            key="db_token")
@@ -856,7 +889,7 @@ with st.sidebar:
 
     # ── BIGQUERY (shown only when source = BigQuery) ──────────────────────────
     elif _source_type == "BigQuery":
-        st.markdown('<div class="sidebar-section">🔵 &nbsp;Google BigQuery</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sidebar-section">{_brand_icon("bigquery")}&nbsp;Google BigQuery</div>', unsafe_allow_html=True)
         if not _BQ_AVAILABLE:
             st.error(f"BigQuery modules not loaded: {_bq_err_msg}")
             st.caption("Run: pip install google-cloud-bigquery sqlglot")
@@ -927,7 +960,7 @@ with st.sidebar:
     st.markdown("---")
 
     # ── AWS S3 ──
-    st.markdown('<div class="sidebar-section">☁️ &nbsp;AWS S3</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-section">{_brand_icon("s3")}&nbsp;AWS S3</div>', unsafe_allow_html=True)
     s3_bucket      = st.text_input("Bucket",          placeholder="my-data-lake",    key="s3_bucket")
     s3_prefix      = st.text_input("Prefix / Path",   placeholder="pipeline/exports", key="s3_prefix")
     s3_access_key  = st.text_input("Access Key ID",   placeholder="AKIA…",           key="s3_access_key")
@@ -937,7 +970,7 @@ with st.sidebar:
     st.markdown("---")
 
     # ── REDSHIFT ──
-    st.markdown('<div class="sidebar-section">🔴 &nbsp;Redshift</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-section">{_brand_icon("redshift")}&nbsp;Redshift</div>', unsafe_allow_html=True)
     rs_workgroup= st.text_input("Workgroup name only e.g. defaultworkgroup", placeholder="defaultworkgroup", key="rs_workgroup", help="Just the short name — not the full endpoint URL")
     rs_db       = st.text_input("Database", placeholder="dev",        key="rs_db")
     rs_region   = st.text_input("Region",   placeholder="ap-south-1", key="rs_region")
@@ -1074,42 +1107,41 @@ rs_node_style = ' style="opacity:0.35;filter:grayscale(1)"' if _s3_only else ""
 st.markdown(f"""
 <div class="pipeline-flow">
   <div class="flow-node flow-node-sf">
-    <div class="flow-node-icon">{"🔵" if _source_type == "BigQuery" else "🟠" if _source_type == "Databricks" else "❄️"}</div>
+    <div class="flow-node-icon">{_brand_icon("bigquery" if _source_type == "BigQuery" else "databricks" if _source_type == "Databricks" else "snowflake")}</div>
     <div class="flow-node-name">{"BIGQUERY" if _source_type == "BigQuery" else "DATABRICKS" if _source_type == "Databricks" else "SNOWFLAKE"}</div>
   </div>
   <div class="flow-arrow {arrow1_cls}">──▶</div>
   <div class="flow-node flow-node-s3">
-    <div class="flow-node-icon">☁️</div>
+    <div class="flow-node-icon">{_brand_icon("s3")}</div>
     <div class="flow-node-name">Amazon S3</div>
   </div>
   <div class="flow-arrow {arrow2_cls}">{"──▶" if not _s3_only else "── ✕"}</div>
   <div class="flow-node flow-node-rs"{rs_node_style}>
-    <div class="flow-node-icon">🔴</div>
+    <div class="flow-node-icon">{_brand_icon("redshift")}</div>
     <div class="flow-node-name">REDSHIFT</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Tab order: Table Discovery · Source→S3 · S3→Redshift · Monitor · Metrics & Logs ──
+# ── Tab order starts with Source Health Check ────────────────────────────────
 _src_label = "BigQuery" if _source_type == "BigQuery" else "Databricks" if _source_type == "Databricks" else "Snowflake"
-_src_icon  = "🔵" if _source_type == "BigQuery" else "🟠" if _source_type == "Databricks" else "❄️"
-tab_discovery, tab1, tab2, tab_monitor, tab3, tab_validate, tab_ddl, tab_qm, tab_hc = st.tabs([
-    "🗂 Table Discovery",
-    f"📤 {_src_label} → S3",
-    "📥 S3 → Redshift",
+tab_hc, tab_discovery, tab1, tab2, tab_monitor, tab3, tab_validate, tab_ddl, tab_qm = st.tabs([
+    "Source Health Check",
+    "🗂Table Discovery",
+    f"📥{_src_label} → S3",
+    "📥S3 → Redshift",
     "📡 Monitor",
     "📊 Metrics & Logs",
     "🔍 Data Validation",
     "🏗 DDL Migrator",
     "🔄 Query Migrator",
-    f"{_src_icon} Source Health Check",
 ])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 0 · Table Discovery  (Chunk 1)
 # ─────────────────────────────────────────────────────────────────────────────
-with tab_discovery:
+with tab_discovery, tab_loading():
     # ── Destination mode reminder ─────────────────────────────────────────────
 
     if _s3_only:
@@ -1294,7 +1326,7 @@ with tab_discovery:
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 1 · Snowflake → S3
 # ─────────────────────────────────────────────────────────────────────────────
-with tab1:
+with tab1, tab_loading():
     # ── Destination mode banner ───────────────────────────────────────────────
 
     if _s3_only:
@@ -1768,7 +1800,7 @@ def _do_redshift_copy(rs_cfg, s3_cfg, s3_key, rs_schema, rs_table, fmt, load_mod
     _rs_run_sql(rs_cfg, sql.strip(), timeout=300)
 
 
-with tab2:
+with tab2, tab_loading():
     st.markdown('<div class="card-title">📥 S3 → Redshift Loader</div>', unsafe_allow_html=True)
 
     # ── Destination mode banner ───────────────────────────────────────────────
@@ -2093,21 +2125,21 @@ with tab2:
     # ─────────────────────────────────────────────────────────────────────────────
     # TAB 3 · Monitor  (Chunk 3)
     # ─────────────────────────────────────────────────────────────────────────────
-with tab_monitor:
+with tab_monitor, tab_loading():
     render_monitoring_tab()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 4 · Metrics & Logs  (Chunk 4 — replaces old Tab 3 content entirely)
 # ─────────────────────────────────────────────────────────────────────────────
-with tab3:
+with tab3, tab_loading():
     render_metrics_tab(s3_bucket=s3_bucket)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 5 · Data Validation  (tab_data_validation.py)
 # ─────────────────────────────────────────────────
-with tab_validate:
+with tab_validate, tab_loading():
     if render_validation_tab is None:
         st.warning("Data Validation is unavailable because tab_data_validation.py is not present.")
     else:
@@ -2422,7 +2454,7 @@ def _render_log_box(log_lines):
     return html
 
 
-with tab_ddl:
+with tab_ddl, tab_loading():
     _ddl_src_label = "BigQuery" if _source_type == "BigQuery" else "Databricks" if _source_type == "Databricks" else "Snowflake"
     st.markdown(f'<div class="card-title">🏗 {_ddl_src_label} → Redshift DDL Converter</div>',
                 unsafe_allow_html=True)
@@ -2440,13 +2472,13 @@ with tab_ddl:
     # BIGQUERY path — delegate entirely to the dedicated BQ DDL UI module
     # ══════════════════════════════════════════════════════════════════════════
     if _source_type == "BigQuery":
-        with ddl_sub_paste:
+        with ddl_sub_paste, tab_loading():
             if not _BQ_AVAILABLE:
                 st.error(f"BigQuery DDL migrator unavailable: {_bq_err_msg}")
                 st.caption("Install with: pip install google-cloud-bigquery sqlglot")
             else:
                 _bq_render_ddl()
-        with ddl_sub_bulk:
+        with ddl_sub_bulk, tab_loading():
             st.info("Connect BigQuery and discover tables to convert DDL from live metadata.")
             if not _BQ_AVAILABLE:
                 st.error(f"BigQuery modules unavailable: {_bq_err_msg}")
@@ -2642,7 +2674,7 @@ CLUSTER BY (ORDER_DATE);"""
         # ══════════════════════════════════════════════════════════════════════
         # SUB-TAB B · Bulk Convert from source
         # ══════════════════════════════════════════════════════════════════════
-        with ddl_sub_bulk:
+        with ddl_sub_bulk, tab_loading():
             st.markdown(
                 f'<div class="card-title">🗄️ Bulk DDL Converter — Browse {_ddl_src_label} & Convert Multiple Tables</div>',
                 unsafe_allow_html=True,
@@ -2991,7 +3023,7 @@ CLUSTER BY (ORDER_DATE);"""
     # ─────────────────────────────────────────────────────────────────────────────
     # TAB 7 · Query Migrator  (query_migrator_app_v2.py / BIQueryMigrator)
     # ─────────────────────────────────────────────────────────────────────────────
-    with tab_qm:
+    with tab_qm, tab_loading():
         _qm_src_label = "BigQuery" if _source_type == "BigQuery" else "Databricks" if _source_type == "Databricks" else "Snowflake"
         st.markdown(f'<div class="card-title">🔄 {_qm_src_label} → Redshift Query & Procedure Migrator</div>', unsafe_allow_html=True)
         st.caption(f"Convert {_qm_src_label} SELECT queries and stored procedures to Redshift-compatible SQL.")
@@ -3002,12 +3034,12 @@ CLUSTER BY (ORDER_DATE);"""
 
     # ── BigQuery path — delegate to BQ query UI module ────────────────────────
     if _source_type == "BigQuery":
-        with qm_tab_query:
+        with qm_tab_query, tab_loading():
             if not _BQ_AVAILABLE:
                 st.error(f"BigQuery Query Migrator unavailable: {_bq_err_msg}")
             else:
                 _bq_render_query()
-        with qm_tab_proc:
+        with qm_tab_proc, tab_loading():
             st.info(
                 "BigQuery uses GoogleSQL which does not have stored procedures in the same "
                 "form as Snowflake/Databricks. Use the **Query Migration** tab to convert "
@@ -3016,7 +3048,7 @@ CLUSTER BY (ORDER_DATE);"""
 
     else:
         # ── Snowflake / Databricks query migration ────────────────────────────
-        with qm_tab_query:
+        with qm_tab_query, tab_loading():
             qm_col_l, qm_col_r = st.columns([1, 1], gap="large")
 
             with qm_col_l:
@@ -3147,7 +3179,7 @@ GROUP BY customer_id, region"""
                 )
 
         # ── Stored Procedure Migration (Snowflake / Databricks only) ──────────
-        with qm_tab_proc:
+        with qm_tab_proc, tab_loading():
             if StoredProcedureMigrator is None:
                 st.markdown(
                     '<span class="badge badge-disconnected">○ StoredProcedureMigrator unavailable — '
@@ -3296,7 +3328,7 @@ st.markdown(f"""
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 9 · Source Health Check  (Snowflake or Databricks)
 # ─────────────────────────────────────────────────────────────────────────────
-with tab_hc:
+with tab_hc, tab_loading():
     _hc_src = st.session_state.get("source_type", "Snowflake")
     _hc_icon = "🔵" if _hc_src == "BigQuery" else "🟠" if _hc_src == "Databricks" else "❄️"
     st.markdown(
@@ -3464,7 +3496,7 @@ with tab_hc:
         ])
 
         # ── 1 · Account Overview ──────────────────────────────────────────────
-        with hc_t1:
+        with hc_t1, tab_loading():
             st.markdown('<div class="card-title">🌐 Account Overview</div>', unsafe_allow_html=True)
             ov_c1, ov_c2 = st.columns(2)
             with ov_c1:
@@ -3503,7 +3535,7 @@ with tab_hc:
             """, "Credits by Feature")
 
         # ── 2 · Warehouse Health ──────────────────────────────────────────────
-        with hc_t2:
+        with hc_t2, tab_loading():
             st.markdown('<div class="card-title">🏢 Warehouse Health</div>', unsafe_allow_html=True)
             wh_c1, wh_c2 = st.columns(2)
             with wh_c1:
@@ -3547,7 +3579,7 @@ with tab_hc:
             """, "Idle Warehouse Credits")
 
         # ── 3 · Query Performance ─────────────────────────────────────────────
-        with hc_t3:
+        with hc_t3, tab_loading():
             st.markdown('<div class="card-title">🔍 Query Performance</div>', unsafe_allow_html=True)
             hc_run_query("""
                 SELECT QUERY_ID, USER_NAME, WAREHOUSE_NAME, EXECUTION_STATUS,
@@ -3576,7 +3608,7 @@ with tab_hc:
             """, "Query Spills")
 
         # ── 4 · Table & Schema ────────────────────────────────────────────────
-        with hc_t4:
+        with hc_t4, tab_loading():
             st.markdown('<div class="card-title">📦 Table & Schema</div>', unsafe_allow_html=True)
             ts_c1, ts_c2 = st.columns(2)
             with ts_c1:
@@ -3615,7 +3647,7 @@ with tab_hc:
             """, "Schema Growth")
 
         # ── 5 · Pipeline Health ───────────────────────────────────────────────
-        with hc_t5:
+        with hc_t5, tab_loading():
             st.markdown('<div class="card-title">🔄 Pipeline Health</div>', unsafe_allow_html=True)
             ph_c1, ph_c2 = st.columns(2)
             with ph_c1:
@@ -3653,7 +3685,7 @@ with tab_hc:
             """, "Idle Pipes")
 
         # ── 6 · Security & RBAC ───────────────────────────────────────────────
-        with hc_t6:
+        with hc_t6, tab_loading():
             st.markdown('<div class="card-title">🔒 Security & RBAC</div>', unsafe_allow_html=True)
             sec_c1, sec_c2 = st.columns(2)
             with sec_c1:
@@ -3689,7 +3721,7 @@ with tab_hc:
             )
 
         # ── 7 · Executive Insights ────────────────────────────────────────────
-        with hc_t7:
+        with hc_t7, tab_loading():
             st.markdown('<div class="card-title">🎯 Executive Insights — Snowflake Account Health Summary</div>', unsafe_allow_html=True)
             st.caption("Aggregated signals from all health-check dimensions, distilled into board-ready KPIs, risk flags, and actionable recommendations.")
             st.markdown("---")
@@ -4333,7 +4365,7 @@ with tab_hc:
             "🎯 Executive Insights",
         ])
 
-        with db_t1:
+        with db_t1, tab_loading():
             st.markdown('<div class="card-title">🌐 Workspace Overview</div>', unsafe_allow_html=True)
             ov_c1, ov_c2 = st.columns(2)
             with ov_c1:
@@ -4357,7 +4389,7 @@ with tab_hc:
                 GROUP BY table_schema ORDER BY TABLE_COUNT DESC
             """, "Tables by Schema")
 
-        with db_t2:
+        with db_t2, tab_loading():
             st.markdown('<div class="card-title">⚙️ Cluster Health</div>', unsafe_allow_html=True)
             st.info(
                 "Full cluster metrics require Unity Catalog system tables "
@@ -4379,7 +4411,7 @@ with tab_hc:
                 ORDER BY table_count DESC
             """, "Tables per Catalog / Schema")
 
-        with db_t3:
+        with db_t3, tab_loading():
             st.markdown('<div class="card-title">🔍 Query Performance</div>', unsafe_allow_html=True)
             st.info(
                 "Full query history requires Unity Catalog system tables "
@@ -4401,7 +4433,7 @@ with tab_hc:
                 ORDER BY view_count DESC
             """, "Views per Schema")
 
-        with db_t4:
+        with db_t4, tab_loading():
             st.markdown('<div class="card-title">📦 Table & Schema</div>', unsafe_allow_html=True)
             ts_c1, ts_c2 = st.columns(2)
             with ts_c1:
@@ -4430,7 +4462,7 @@ with tab_hc:
                 LIMIT 200
             """, "Column Details (top 200)")
 
-        with db_t5:
+        with db_t5, tab_loading():
             st.markdown('<div class="card-title">🔄 Jobs & Pipelines</div>', unsafe_allow_html=True)
             st.info(
                 "Job run history requires Unity Catalog system tables "
@@ -4454,7 +4486,7 @@ with tab_hc:
                 LIMIT 100
             """, "Table Grants")
 
-        with db_t6:
+        with db_t6, tab_loading():
             st.markdown('<div class="card-title">🔒 Security & Access</div>', unsafe_allow_html=True)
             st.info(
                 "Full audit logs require Unity Catalog system tables "
@@ -4497,7 +4529,7 @@ with tab_hc:
             )
 
         # ── 7 · Executive Insights ────────────────────────────────────────────
-        with db_t7:
+        with db_t7, tab_loading():
             st.markdown('<div class="card-title">🎯 Executive Insights — Databricks Workspace Health Summary</div>', unsafe_allow_html=True)
             st.caption("Aggregated signals from Unity Catalog and Hive Metastore, distilled into board-ready KPIs, risk flags, and actionable recommendations.")
             st.markdown("---")

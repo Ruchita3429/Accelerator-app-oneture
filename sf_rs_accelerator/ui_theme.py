@@ -5,11 +5,52 @@ Streamlit does not expose a public per-session theme setter; native widgets stay
 native and CSS supplies the two palettes. Never mutate global Streamlit config.
 """
 from pathlib import Path
+import base64
+from contextlib import contextmanager
+from functools import lru_cache
 
 import streamlit as st
 
 
 THEME_KEY = "databridge_appearance"
+
+
+@lru_cache(maxsize=3)
+def brand_image(name):
+    """Embed supplied local assets with intrinsic sizing before CSS arrives."""
+    assets = {"bigquery": ("bigquery.svg", "image/svg+xml"),
+              "s3": ("s3.jpg", "image/jpeg"),
+              "redshift": ("redshift.png", "image/png")}
+    if name not in assets:
+        return None
+    filename, mime = assets[name]
+    data = (Path(__file__).parent / "assets" / "brands" / filename).read_bytes()
+    encoded = base64.b64encode(data).decode("ascii")
+    return (f'<img class="brand-icon brand-icon-{name}" width="18" height="18" '
+            f'alt="" aria-hidden="true" style="object-fit:contain;max-width:28px;max-height:28px" '
+            f'src="data:{mime};base64,{encoded}">')
+
+
+@contextmanager
+def tab_loading():
+    """A real render-lifecycle placeholder; never delays or masks controls.
+
+    Streamlit renders all tab bodies during a run. Fast tabs may complete before
+    a browser paints the skeleton; slow bodies retain it until completion.
+    Clear in finally so errors and st.stop cannot strand a loading indicator.
+    """
+    placeholder = st.empty()
+    placeholder.markdown(
+        '<div class="tab-loading" role="status" aria-label="Loading tab content">'
+        '<span class="tab-loading-label">Loading…</span>'
+        '<span class="tab-loading-bar"></span>'
+        '<span class="tab-loading-bar"></span></div>',
+        unsafe_allow_html=True,
+    )
+    try:
+        yield
+    finally:
+        placeholder.empty()
 
 PALETTES = {
     "light": {

@@ -33,9 +33,17 @@ selected tab on every row. Keyboard focus has a separate visible outline.
 Existing literal HTML colors are mapped through narrowly scoped CSS attribute
 selectors. This avoids rewriting status decisions, generated SQL, report data,
 or existing HTML text. Validation's existing CSS variable names are supplied.
-The pipeline illustration uses local, neutral database/cloud glyphs because no
-licensed official brand assets are bundled. Existing navigation labels/icons
-are retained.
+The existing icon spaces use the supplied BigQuery SVG, Redshift PNG and S3
+JPEG from `assets/brands`, plus the supplied inline DataBridge, Snowflake and
+Databricks paths. SVG and image elements have intrinsic width/height attributes
+and inline maximum dimensions so they cannot flash at their natural size before
+the stylesheet arrives. Existing navigation labels and routing are retained.
+
+`tab_loading()` provides a temporary, accessible skeleton during each main and
+nested tab body render, including the standalone query and BigQuery DDL views.
+A `finally` block clears it on success or failure. It adds no artificial delay,
+overlay, replacement controls or animation. Already-rendered tab switches need
+no loader; the skeleton cannot precede Streamlit mounting the Python output.
 
 ## Streamlit constraints
 
@@ -43,8 +51,15 @@ This implementation targets the installed Streamlit 1.63.0. Its public
 `st.set_option` does not support changing theme options per session. The code
 therefore does not mutate private/global configuration from a button callback.
 Native widgets use CSS palettes; Streamlit-specific surfaces use `data-testid`
-selectors and BaseWeb controls use their component attributes, not generated
-Emotion class names. Recheck these selectors when upgrading Streamlit.
+selectors and React Aria roles/component attributes, not generated Emotion
+class names. Recheck these selectors when upgrading Streamlit.
+
+The input styling defect came from obsolete BaseWeb selectors: the current
+React Aria control wrappers retained light backgrounds while their child inputs
+were dark. Styling now covers the actual outer input, number, textarea, select
+and multiselect surfaces, native icon buttons and portaled option highlights.
+Hover/focus change only color and shadow, preserving native geometry. Light-mode
+controls use subtle borders/shadows; both palettes retain validation states.
 
 Glide data grids and Vega canvas charts draw pixels rather than HTML. A scoped
 dark-mode filter adapts their native light canvas without replacing tables,
@@ -72,12 +87,17 @@ transient Streamlit value-sync flags are excluded, while actual values are check
 No cloud connection, migration, authentication submission, demo activation or
 remote write is performed.
 
-The local Streamlit server started successfully on `127.0.0.1:8502` after local
-socket access was allowed outside the sandbox. Browser verification was blocked:
-the in-app browser could not bind its tab, and Windows computer use stopped
-because it could not confidently determine the browser URL. Consequently,
-repeated sidebar collapse/recovery, tab wrapping at different widths, popup
-placement and live screenshots have **not** been visually verified.
+The local Streamlit server started successfully on `127.0.0.1:8502`. All eight
+unit/AppTest checks passed. Additional checks cover intrinsic icon sizes and
+skeleton cleanup on successful and failing renders.
+
+Live browser verification confirmed both themes, dark dropdown surfaces and
+keyboard option focus, the empty multiselect menu, native password show/hide,
+disabled-field text, SQL textareas, and skeleton appearance/cleanup. The inspected
+text input retained its 40 px root height, padding and radius across both themes
+and hover/focus. Supplied images loaded at 18 px in the sidebar and 28 px in the
+pipeline. Screenshots are saved in `ui-verification/`. Populated multiselect tags,
+date/time popovers and connected-data displays were not exercised.
 
 Before release, check in both modes at desktop and narrow widths:
 
@@ -92,3 +112,25 @@ Before release, check in both modes at desktop and narrow widths:
 
 Cloud-dependent execution was inspected but not exercised. Existing missing
 optional modules or connection-dependent failures are outside this UI change.
+
+## Cached-module recovery and regression check (2026-10-27)
+
+A running server retained the older `ui_theme` module without `brand_image` or
+`tab_loading`, causing the reported ImportError. The main entry point now checks
+for the required presentation exports before importing dependent UI modules and
+reloads only an outdated presentation module. It does not clear session state or
+reload migration modules as part of this fix. A regression test removes those
+exports from the cached module and verifies recovery, input/theme persistence,
+and subsequent BigQuery rendering.
+
+All 11 unit/AppTest tests pass, including real offline BigQuery DDL/query
+conversion, invalid-input rejection and the previous UI/state checks. The original
+server on localhost:8501 was verified to render successfully. The existing mmh3 /
+Iceberg bucket-transform smoke test passed. The validation scratch assertion was
+updated from the obsolete `only_in_sf` key to the current `only_in_src` contract;
+its module/type-normalization and mocked schema-comparison checks passed.
+
+The environment does not have `snowflake-snowpark-python`, so Snowflake health
+checks requiring Snowpark remain unavailable. Cloud authentication, live discovery,
+S3 writes, Redshift COPY, monitoring with live jobs and live validation were not
+executed. Passing offline checks does not establish end-to-end cloud correctness.

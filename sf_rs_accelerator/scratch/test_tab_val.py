@@ -61,7 +61,7 @@ def test_schema_check_logic():
         res = tdv.run_schema_check({}, {}, 'public', 'orders', 'PUBLIC', 'ORDERS')
         assert res['common_cols'] == ['amount', 'id', 'name']
         assert res['only_in_rs'] == []
-        assert res['only_in_sf'] == []
+        assert res['only_in_src'] == []
         print("Schema check result:", res['passed'], "type_mismatches:", res['type_mismatches'])
 
 def test_render_tab():
