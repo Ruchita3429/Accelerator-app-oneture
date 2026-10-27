@@ -236,3 +236,6 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible,
 @media (prefers-reduced-motion: no-preference) {
     .stTabs [role="tab"], [data-testid^="stBaseButton"] { transition: background-color 120ms ease, border-color 120ms ease; }
 }
+
+/* Official Iceberg asset includes its wordmark; preserve its aspect ratio. */
+.brand-icon-iceberg { width: 66px; max-width: 66px !important; height: 18px; }

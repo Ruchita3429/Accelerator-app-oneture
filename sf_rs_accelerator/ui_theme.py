@@ -15,10 +15,11 @@ import streamlit as st
 THEME_KEY = "databridge_appearance"
 
 
-@lru_cache(maxsize=3)
+@lru_cache(maxsize=4)
 def brand_image(name):
     """Embed supplied local assets with intrinsic sizing before CSS arrives."""
-    assets = {"bigquery": ("bigquery.svg", "image/svg+xml"),
+    assets = {"iceberg": ("iceberg.svg", "image/svg+xml"),
+              "bigquery": ("bigquery.svg", "image/svg+xml"),
               "s3": ("s3.jpg", "image/jpeg"),
               "redshift": ("redshift.png", "image/png")}
     if name not in assets:

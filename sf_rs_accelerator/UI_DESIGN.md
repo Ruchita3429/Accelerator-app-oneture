@@ -134,3 +134,18 @@ The environment does not have `snowflake-snowpark-python`, so Snowflake health
 checks requiring Snowpark remain unavailable. Cloud authentication, live discovery,
 S3 writes, Redshift COPY, monitoring with live jobs and live validation were not
 executed. Passing offline checks does not establish end-to-end cloud correctness.
+
+## Consistent technology logos
+
+`ui_brands.py` is the shared renderer for existing logo slots in the sidebar,
+pipeline, footer, S3/Redshift cards, DDL/query/procedure headings, health heading,
+validation selectors and Iceberg format banner. Supplied assets and inline paths
+are reused; the official Iceberg wordmark is bundled locally with provenance in
+`assets/brands/README.md`. The footer now follows BigQuery selection correctly.
+Plain prose, native widget labels, routing and workflow icons remain unchanged.
+Backup files under `bkp/` are historical and are not part of the active UI.
+
+The 11 regression tests passed after centralizing the renderer; a subsequent
+asset check verified the bundled Iceberg SVG. Browser inspection confirmed the
+footer's three logos load at 18 px. Connected-only panels were checked statically,
+not with cloud credentials.

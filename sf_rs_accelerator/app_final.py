@@ -724,30 +724,8 @@ def get_redshift_tables(cfg, schema, _raise=False):
 
 
 # ── Brand marks ───────────────────────────────────────────────────────────────
-_BRAND_MARKS = {
-    "databridge": '<path d="M3 19h18M5 19V9l7-5 7 5v10M8 19v-5h8v5M5 10h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
-    "snowflake": '<path d="M12 2v20M3.34 7l17.32 10M3.34 17 20.66 7M8 4l4 4 4-4M8 20l4-4 4 4M3 11l5 1-1 5M21 13l-5-1 1-5M3 13l5-1-1-5M21 11l-5 1 1 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>',
-    "databricks": '<path d="M.95 14.184 12 20.403l9.919-5.55v2.21L12 22.662l-10.484-5.96-.565.308v.77L12 24l11.05-6.218v-4.317l-.515-.309L12 19.118l-9.867-5.653v-2.21L12 16.805l11.05-6.218V6.32l-.515-.308L12 11.974 2.647 6.681 12 1.388l7.76 4.368.668-.411v-.566L12 0 .95 6.27v.72L12 13.207l9.919-5.55v2.26L12 15.52 1.516 9.56l-.565.308Z"/>',
-    "bigquery": '<path d="M4 3h5v18H4zM10 3h5v18h-5zM16 3h4v18h-4z"/>',
-    "s3": '<path d="M4 7h16l-1.2 13H5.2L4 7Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M7 4c3-2 7-2 10 0M8 13c2 1 6 1 8 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="m15 11 2 2-2 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>',
-    "redshift": '<ellipse cx="12" cy="5" rx="8" ry="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 5v13c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11c0 1.7 3.6 3 8 3s8-1.3 8-3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 8h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
-}
+from ui_brands import brand_icon as _brand_icon
 
-
-def _brand_icon(name):
-    """Return a supplied asset or a dimensioned inline SVG brand mark."""
-    image = brand_image(name)
-    if image is not None:
-        return image
-    return (
-        f'<svg class="brand-icon brand-icon-{name}" viewBox="0 0 24 24" '
-        f'width="18" height="18" fill="currentColor" '
-        f'style="max-width:28px;max-height:28px" '
-        f'aria-hidden="true">{_BRAND_MARKS[name]}</svg>'
-    )
-
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"""
     <div class="brand-header">
@@ -1451,7 +1429,7 @@ with tab1, tab_loading():
         row_limit = st.number_input("Row limit per table (0 = all rows)", min_value=0, value=0, key="sf_row_limit")
 
     with col_right:
-        st.markdown('<div class="card-title">☁️ Target — Amazon S3</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="card-title">{_brand_icon("s3")} Target — Amazon S3</div>', unsafe_allow_html=True)
 
         file_format = st.selectbox("File Format", ["CSV", "Parquet", "Iceberg", "JSON", "ORC"], key="s3_file_format")
 
@@ -1475,7 +1453,7 @@ with tab1, tab_loading():
                 '<div style="background:#162040;border:1px solid #2a4080;border-radius:10px;'
                 'padding:12px 16px;margin-top:8px">'
                 '<div style="color:#7aa8f5;font-size:13px;font-weight:600;margin-bottom:4px">'
-                '🧊 Iceberg Format Selected</div>'
+                f'{_brand_icon("iceberg")} Iceberg Format Selected</div>'
                 '<div style="color:#8891a8;font-size:12px;line-height:1.7">'
                 'Data will be written to S3 as an Apache Iceberg table using <code>pyiceberg</code> and AWS Glue.<br>'
                 'Layout: <code>s3://bucket/prefix/SCHEMA/TABLE/metadata/</code> + <code>data/</code><br>'
@@ -1824,7 +1802,7 @@ with tab2, tab_loading():
         # LEFT COLUMN — S3 bucket browser
         # ─────────────────────────────────────────────────────────────────────────
         with t2_col_src:
-            st.markdown('<div class="card-title">☁️ Source — Amazon S3</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="card-title">{_brand_icon("s3")} Source — Amazon S3</div>', unsafe_allow_html=True)
 
             t2_bucket = st.text_input(
                 "S3 Bucket",
@@ -1955,7 +1933,7 @@ with tab2, tab_loading():
         # RIGHT COLUMN — Redshift target
         # ─────────────────────────────────────────────────────────────────────────
         with t2_col_tgt:
-            st.markdown('<div class="card-title">🔴 Target — Redshift</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="card-title">{_brand_icon("redshift")} Target — Redshift</div>', unsafe_allow_html=True)
 
             _rscfg_t2 = {
                 "workgroup": rs_workgroup,
@@ -2496,7 +2474,7 @@ with tab_ddl, tab_loading():
     if _source_type != "BigQuery":
         ddl_col_l, ddl_col_r = st.columns([1, 1], gap="large")
         with ddl_col_l:
-            st.markdown(f'<div class="card-title">{"🟠 Databricks" if _source_type == "Databricks" else "❄️ Snowflake"} DDL Input</div>',
+            st.markdown(f'<div class="card-title">{_brand_icon(_source_type.lower())} {_source_type} DDL Input</div>',
                         unsafe_allow_html=True)
             _ddl_placeholder = (
                 """CREATE TABLE orders (
@@ -2529,7 +2507,7 @@ CLUSTER BY (ORDER_DATE);"""
             )
 
         with ddl_col_r:
-            st.markdown('<div class="card-title">🔴 Redshift DDL Output</div>',
+            st.markdown(f'<div class="card-title">{_brand_icon("redshift")} Redshift DDL Output</div>',
                         unsafe_allow_html=True)
             if st.session_state.ddl_output:
                 st.code(st.session_state.ddl_output, language="sql")
@@ -2702,7 +2680,7 @@ CLUSTER BY (ORDER_DATE);"""
                 bulk_top_l, bulk_top_r = st.columns([1, 1], gap="large")
 
                 with bulk_top_l:
-                    st.markdown(f'<div class="card-title">{"🟠" if _source_type == "Databricks" else "❄️"} Step 1 — Choose Schema & Tables</div>',
+                    st.markdown(f'<div class="card-title">{_brand_icon(_source_type.lower())} Step 1 — Choose Schema & Tables</div>',
                                 unsafe_allow_html=True)
 
                     bulk_schema_opts = (_source_schemas
@@ -3052,7 +3030,7 @@ CLUSTER BY (ORDER_DATE);"""
             qm_col_l, qm_col_r = st.columns([1, 1], gap="large")
 
             with qm_col_l:
-                st.markdown(f'<div class="card-title">{"🔵 BigQuery" if _source_type == "BigQuery" else "🟠 Databricks" if _source_type == "Databricks" else "❄️ Snowflake"} Query</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="card-title">{_brand_icon(_source_type.lower())} {_source_type} Query</div>', unsafe_allow_html=True)
             _qm_placeholder = (
                 """SELECT
     customer_id,
@@ -3081,7 +3059,7 @@ GROUP BY customer_id, region"""
             )
 
         with qm_col_r:
-            st.markdown('<div class="card-title">🔴 Redshift Query</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="card-title">{_brand_icon("redshift")} Redshift Query</div>', unsafe_allow_html=True)
             st.text_area(
                 "Redshift SQL Output",
                 value=st.session_state.get("qm_query_output", ""),
@@ -3190,7 +3168,7 @@ GROUP BY customer_id, region"""
                 qm_proc_col_l, qm_proc_col_r = st.columns([1, 1], gap="large")
 
             with qm_proc_col_l:
-                st.markdown(f'<div class="card-title">{"🟠 Databricks" if _source_type == "Databricks" else "❄️ Snowflake"} Procedure</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="card-title">{_brand_icon(_source_type.lower())} {_source_type} Procedure</div>', unsafe_allow_html=True)
                 _proc_placeholder = (
                     """CREATE OR REPLACE PROCEDURE sp_process_orders(p_date DATE)
 LANGUAGE SQL
@@ -3221,7 +3199,7 @@ LANGUAGE SQL;"""
                 )
 
             with qm_proc_col_r:
-                st.markdown('<div class="card-title">🔴 Redshift Procedure</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="card-title">{_brand_icon("redshift")} Redshift Procedure</div>', unsafe_allow_html=True)
                 st.text_area(
                     "Redshift Procedure Output",
                     value=st.session_state.get("qm_proc_output", ""),
@@ -3321,8 +3299,8 @@ st.markdown("---")
 st.markdown(f"""
 <div style="text-align:center; color:#3a4255; font-size:12px; font-family:'DM Mono',monospace; padding:8px 0">
     DataBridge Pipeline Studio &nbsp;·&nbsp;
-    {"Databricks 🟠" if st.session_state.get("source_type") == "Databricks" else "Snowflake ❄️"}
-    → S3 ☁️ → Redshift 🔴
+    {_brand_icon(_source_type.lower())} {_source_type}
+    → {_brand_icon("s3")} S3 → {_brand_icon("redshift")} Redshift
 </div>
 """, unsafe_allow_html=True)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3330,7 +3308,7 @@ st.markdown(f"""
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_hc, tab_loading():
     _hc_src = st.session_state.get("source_type", "Snowflake")
-    _hc_icon = "🔵" if _hc_src == "BigQuery" else "🟠" if _hc_src == "Databricks" else "❄️"
+    _hc_icon = _brand_icon(_hc_src.lower())
     st.markdown(
         f'<div class="card-title">{_hc_icon} {_hc_src} Account Health Check</div>',
         unsafe_allow_html=True,

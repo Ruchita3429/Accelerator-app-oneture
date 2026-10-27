@@ -106,13 +106,8 @@ class ThemeTests(unittest.TestCase):
             placeholder.empty.assert_called_once()
 
     def test_icons_have_intrinsic_size_without_css(self):
-        # Load only the presentation definitions, without executing the app.
-        tree = ast.parse((ROOT / 'app_final.py').read_text(encoding='utf-8'))
-        nodes = [n for n in tree.body if
-                 (isinstance(n, ast.FunctionDef) and n.name == '_brand_icon') or
-                 (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == '_BRAND_MARKS' for t in n.targets))]
-        scope = {'brand_image': brand_image}
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<icon helpers>', 'exec'), scope)
+        from ui_brands import brand_icon, _BRAND_MARKS
+        scope = {'_brand_icon': brand_icon, '_BRAND_MARKS': _BRAND_MARKS}
 
         class TagReader(HTMLParser):
             def handle_starttag(self, tag, attrs):

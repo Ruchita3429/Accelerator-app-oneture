@@ -9,6 +9,8 @@ Supports both Databricks (DBX) <-> Redshift and Snowflake (SF) <-> Redshift vali
 - MD5 hash-based data proximity & sampled similarity
 """
 
+from ui_brands import brand_icon
+
 import time
 import streamlit as st
 import pandas as pd
@@ -839,7 +841,7 @@ def _render_table_selectors(rs_cfg, src_cfg, source_type="Snowflake"):
     """Dual table selectors for Redshift Destination vs Source (Databricks/Snowflake)."""
     is_db = (source_type == "Databricks")
     src_name = "Databricks" if is_db else "Snowflake"
-    src_icon = "🟠" if is_db else "❄️"
+    src_icon = brand_icon("databricks" if is_db else "snowflake")
     src_color = "var(--amber)" if is_db else "var(--blue)"
 
     _section('🗂 Select Tables to Compare')
@@ -851,7 +853,7 @@ def _render_table_selectors(rs_cfg, src_cfg, source_type="Snowflake"):
 
     with col_rs:
         st.markdown(
-            '<div style="color:var(--red);font-size:12px;font-family:\'DM Mono\',monospace;margin-bottom:6px">🔴 REDSHIFT — Destination</div>',
+            f'<div style="color:var(--red);font-size:12px;font-family:\'DM Mono\',monospace;margin-bottom:6px">{brand_icon("redshift")} REDSHIFT — Destination</div>',
             unsafe_allow_html=True,
         )
         if not st.session_state.get('rs_connected', False):
