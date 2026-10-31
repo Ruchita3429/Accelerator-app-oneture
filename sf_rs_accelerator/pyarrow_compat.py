@@ -23,6 +23,16 @@ the BigQuery connectors).
 
 import sys
 import types
+import os
+
+# The native ORC writer needs IANA files on Windows, even for naive timestamps.
+# Reuse the timezone database already installed with the app.
+if sys.platform == "win32" and not os.environ.get("TZDIR"):
+    try:
+        import tzdata
+        os.environ["TZDIR"] = os.path.join(os.path.dirname(tzdata.__file__), "zoneinfo")
+    except ImportError:
+        pass
 
 
 # ---------------------------------------------------------------------------

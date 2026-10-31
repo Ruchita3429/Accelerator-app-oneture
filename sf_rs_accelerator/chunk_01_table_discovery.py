@@ -299,6 +299,10 @@ def render_table_discovery(
         rs_schemas = kwargs.get("rs_schemas", [])
 
     _active_src = kwargs.get("source_type", source_type) or st.session_state.get("source_type", "Snowflake")
+    if _active_src == "BigQuery":
+        from bigquery_ui import render_discovery
+        render_discovery(kwargs.get("s3_cfg", {}), kwargs.get("rs_cfg", {}))
+        return
     is_db = (_active_src == "Databricks")
     source_name = "Databricks" if is_db else "Snowflake"
     is_connected = st.session_state.get("db_connected", False) if is_db else st.session_state.get("sf_connected", False)

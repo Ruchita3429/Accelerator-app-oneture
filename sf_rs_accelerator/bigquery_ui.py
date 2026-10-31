@@ -4,7 +4,7 @@ from datetime import datetime
 
 import streamlit as st
 
-from pipeline_routes import BQ_S3, BQ_REDSHIFT, formats_for, reset_queue
+from pipeline_routes import BQ_S3, BQ_REDSHIFT, formats_for, reset_queue, resolve_route
 
 
 def render_connection():
@@ -63,7 +63,8 @@ def config_fingerprint(s3_cfg, rs_cfg, route):
 
 def build_queue(project, selected, table_map, settings, s3_cfg, rs_cfg, connection_id):
     import uuid
-    route = settings['destination']
+    route = resolve_route(settings['destination'], 'BigQuery')
+    settings = {**settings, 'destination': route}
     fmt = settings['file_format']
     if fmt not in formats_for(route): raise ValueError('Choose a valid file format for this route.')
     if route == BQ_REDSHIFT and not settings['rs_schema']:
@@ -140,7 +141,7 @@ def _selection_form(scope, s3_cfg, rs_cfg, execute):
         if len(selected) == 1:
             with st.expander('Source schema'):
                 st.dataframe(info.get('schema', []), hide_index=True)
-    route = st.session_state.pipeline_destination
+    route = resolve_route(st.session_state.pipeline_destination, 'BigQuery')
     formats = formats_for(route)
     format_key = f'bq_{scope}_format'
     if st.session_state.get(format_key) not in formats:

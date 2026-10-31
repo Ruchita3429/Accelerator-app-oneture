@@ -13,8 +13,7 @@ Writes compliant Apache Iceberg v2 table format:
 
 Also registers/syncs the table in AWS Glue Data Catalog as an EXTERNAL Iceberg table
 compatible with Amazon Redshift Spectrum, Amazon Athena, and Apache Spark.
-Does NOT require pyarrow C-extension DLLs (_dataset / _parquet), making it 100% immune
-to Windows Application Control / AppLocker / Smart App Control policy restrictions.
+Uses PyArrow for typed Parquet serialization, including Python dates and decimals.
 """
 
 import io
@@ -22,30 +21,36 @@ import json
 import time
 import uuid
 import boto3
+import pyarrow_compat
 import pandas as pd
-import fastparquet
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
-def _map_dtype_to_iceberg_and_glue(dtype_str: str):
-    """Map pandas/numpy dtype string to (iceberg_type, glue_type)."""
-    dt = dtype_str.lower()
-    if "int8" in dt or "int16" in dt:
+def _map_arrow_type_to_iceberg_and_glue(dtype):
+    """Use the serialized column type rather than pandas' ambiguous 'object'."""
+    if pa.types.is_signed_integer(dtype) and dtype.bit_width <= 32:
         return "int", "int"
-    if "int" in dt:
+    if pa.types.is_integer(dtype):
         return "long", "bigint"
-    if "float16" in dt or "float32" in dt:
+    if pa.types.is_float32(dtype):
         return "float", "float"
-    if "float" in dt or "double" in dt:
+    if pa.types.is_floating(dtype):
         return "double", "double"
-    if "bool" in dt:
+    if pa.types.is_boolean(dtype):
         return "boolean", "boolean"
-    if "datetime" in dt or "timestamp" in dt:
-        return "timestamp", "timestamp"
-    if "date" in dt:
+    if pa.types.is_timestamp(dtype):
+        return "timestamptz" if dtype.tz else "timestamp", "timestamp"
+    if pa.types.is_date(dtype):
         return "date", "date"
-    if "bytes" in dt or "binary" in dt:
+    if pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
         return "binary", "binary"
-    return "string", "string"
+    if pa.types.is_decimal(dtype) and dtype.precision <= 38:
+        decimal = f"decimal({dtype.precision},{dtype.scale})"
+        return decimal, decimal
+    if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+        return "string", "string"
+    raise ValueError(f"Unsupported Iceberg column type: {dtype}")
 
 
 def write_iceberg_table_to_s3(
@@ -82,9 +87,27 @@ def write_iceberg_table_to_s3(
     table_location = f"s3://{bucket}/{table_dir}"
     _log(f"Iceberg: preparing table layout at {table_location}/")
 
-    # 2. Serialize data to Parquet using fastparquet (pure C/Rust, WDAC-allowed)
+    # 2. Infer real object-column types once for both Parquet and catalog metadata.
+    arrow_table = pa.Table.from_pandas(df, preserve_index=False)
+    arrow_fields = []
+    for i, field in enumerate(arrow_table.schema, 1):
+        # An all-null object column has no inferred type; retain its previous
+        # nullable-string fallback in both the data file and catalog.
+        dtype = pa.string() if pa.types.is_null(field.type) else field.type
+        arrow_fields.append(pa.field(field.name, dtype, nullable=True,
+                                     metadata={b"PARQUET:field_id": str(i).encode()}))
+    arrow_table = arrow_table.cast(pa.schema(arrow_fields))
+
+    fields = []
+    glue_columns = []
+    for i, field in enumerate(arrow_table.schema, 1):
+        ice_type, glue_type = _map_arrow_type_to_iceberg_and_glue(field.type)
+        fields.append({"id": i, "name": field.name, "required": False, "type": ice_type})
+        glue_columns.append({"Name": field.name, "Type": glue_type})
+
     pq_buf = io.BytesIO()
-    fastparquet.write(pq_buf, df, compression="snappy")
+    pq.write_table(arrow_table, pq_buf, compression="snappy",
+                   coerce_timestamps="us", version="1.0")
     parquet_bytes = pq_buf.getvalue()
     total_bytes = len(parquet_bytes)
     total_rows = len(df)
@@ -92,22 +115,6 @@ def write_iceberg_table_to_s3(
     data_uuid = uuid.uuid4().hex[:12]
     data_filename = f"{data_uuid}-00000.parquet"
     data_key = f"{table_dir}/data/{data_filename}"
-
-    # 3. Build schema fields for Iceberg & Glue
-    fields = []
-    glue_columns = []
-    for i, (col, dtype) in enumerate(df.dtypes.items(), 1):
-        ice_type, glue_type = _map_dtype_to_iceberg_and_glue(str(dtype))
-        fields.append({
-            "id": i,
-            "name": str(col),
-            "required": False,
-            "type": ice_type,
-        })
-        glue_columns.append({
-            "Name": str(col),
-            "Type": glue_type,
-        })
 
     # 4. Build compliant Apache Iceberg v2 TableMetadata JSON
     now_ms = int(time.time() * 1000)

@@ -30,7 +30,8 @@ if not all(hasattr(_ui_theme, name) for name in
 
 try:
     from bigquery_connector   import create_client as _bq_create_client, list_datasets as _bq_list_datasets, discover_tables as _bq_discover_tables
-    from bigquery_ddl_ui      import render_ddl_migrator as _bq_render_ddl
+    # The main app owns the paste/metadata tabs; render each panel only once.
+    from bigquery_ddl_ui      import _paste_tab as _bq_render_ddl
     from bigquery_query_ui    import render_query_migrator as _bq_render_query
     from bigquery_health_ui   import render_bigquery_health_check as _bq_render_health
     _BQ_AVAILABLE = True
@@ -44,6 +45,7 @@ import time
 import io
 import json
 from datetime import datetime
+from pipeline_routes import resolve_route, s3_only, reset_queue
 
 # ── Chunk module imports ──────────────────────────────────────────────────────
 import importlib
@@ -52,7 +54,6 @@ import chunk_02_job_queue_engine
 importlib.reload(chunk_01_table_discovery)
 importlib.reload(chunk_02_job_queue_engine)
 from chunk_01_table_discovery import render_table_discovery, get_job_queue_summary
-import chunk_02_job_queue_engine as _chunk02
 from chunk_02_job_queue_engine import render_execution_controls, run_migration
 from chunk_03_monitoring_ui   import render_monitoring_tab
 from chunk_04_metrics_report  import render_metrics_tab
@@ -68,31 +69,7 @@ try:
 except ImportError:
     ddl_migrator = None
 
-# ── S3-only gate: patch chunk_02's run_migration so COPY is skipped when
-#    pipeline_destination == "SF → S3 only".  chunk_02 reads st.session_state
-#    so no signature change is needed — we just store the flag there.
-#    render_execution_controls internally calls run_migration (or the same COPY
-#    helpers), so storing the flag before render is sufficient.  As a belt-and-
-#    suspenders measure, we also wrap run_migration itself. ──────────────────────
-_orig_run_migration = run_migration
-
-def _run_migration_gated(*args, **kwargs):
-    """Wrap run_migration to skip the Redshift COPY leg in S3-only mode."""
-    import streamlit as _st
-    dest = _st.session_state.get("pipeline_destination", "")
-    if "s3 only" in dest.lower():
-        _orig_load = getattr(_chunk02, "_load_s3_to_redshift", None)
-        _chunk02._load_s3_to_redshift = lambda *a, **kw: {"rs_rows": 0, "rs_duration_secs": 0}
-        try:
-            return _orig_run_migration(*args, **kwargs)
-        finally:
-            if _orig_load:
-                _chunk02._load_s3_to_redshift = _orig_load
-    else:
-        return _orig_run_migration(*args, **kwargs)
-
-run_migration = _run_migration_gated
-_chunk02.run_migration = _run_migration_gated  # patch module-level ref too
+# The executor owns route handling, including S3-only mode, per session.
 try:
     from st_to_rs_bi_query_migration import StoredProcedureMigrator, BIQueryMigrator
 except ImportError:
@@ -748,6 +725,7 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     if _src_sel != st.session_state.get("source_type"):
+        reset_queue(st.session_state)
         st.session_state["source_type"] = _src_sel
         # reset connection state when switching sources
         st.session_state.sf_connected    = False
@@ -1055,11 +1033,12 @@ with _dest_col:
         help="Choose whether data lands in S3 only, or continues into Redshift via COPY.",
     )
     if _selected_dest != st.session_state.get("pipeline_destination"):
+        reset_queue(st.session_state)
         st.session_state["pipeline_destination"] = _selected_dest
         st.rerun()
 
 _dest_mode = st.session_state.get("pipeline_destination", "Source → S3 → Redshift")
-_s3_only   = (_dest_mode == "Source → S3 only")
+_s3_only   = s3_only(resolve_route(_dest_mode, _source_type))
 
 with _dest_info_col:
     if _s3_only:
@@ -1280,6 +1259,8 @@ with tab_discovery, tab_loading():
         rs_schemas=st.session_state.rs_schemas,
         source_type=_source_type,
         db_cfg=_db_cfg,
+        s3_cfg=_s3_cfg,
+        rs_cfg=_rs_cfg,
     )
 
     # ── After queue is built, stamp partition/filter flags onto each job ───────
@@ -1305,362 +1286,379 @@ with tab_discovery, tab_loading():
 # TAB 1 · Snowflake → S3
 # ─────────────────────────────────────────────────────────────────────────────
 with tab1, tab_loading():
-    # ── Destination mode banner ───────────────────────────────────────────────
-
-    if _s3_only:
-        st.markdown(
-            """
-            <div style="
-                background: var(--secondary-background-color);
-                border: 1px solid #D97706;
-                border-left: 4px solid #D97706;
-                border-radius: 8px;
-                padding: 12px 16px;
-                color: var(--text-color);
-                font-size: 14px;
-                line-height: 1.6;
-                margin-bottom: 12px;
-            ">
-                <strong style="color: #D97706;">S3-only mode</strong>
-                <span> — The queue will export to S3 and stop there.
-                The Redshift COPY step will be skipped.
-                Change the <strong>Pipeline Destination</strong>
-                dropdown above to enable the full pipeline.</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    if _source_type == "BigQuery":
+        from bigquery_ui import render_export
+        render_export(_s3_cfg, _rs_cfg)
     else:
-        st.markdown(
-            """
-            <div style="
-                background: var(--secondary-background-color);
-                border: 1px solid #16A34A;
-                border-left: 4px solid #16A34A;
-                border-radius: 8px;
-                padding: 12px 16px;
-                color: var(--text-color);
-                font-size: 14px;
-                line-height: 1.6;
-                margin-bottom: 12px;
-            ">
-                <strong style="color: #16A34A;">Full pipeline mode</strong>
-                <span> — The queue will run
-                Snowflake → S3 → Redshift COPY.</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        # ── Destination mode banner ───────────────────────────────────────────────
 
-    col_left, col_right = st.columns([1, 1], gap="large")
-
-    with col_left:
-        st.markdown(f'<div class="card-title">🗂 Source — {_source_type}</div>', unsafe_allow_html=True)
-
-        # Schema picker
-        if _source_type == "Databricks":
-            src_schema_opts = st.session_state.db_schemas if st.session_state.db_connected else ["— connect first —"]
+        if _s3_only:
+            st.markdown(
+                """
+                <div style="
+                    background: var(--secondary-background-color);
+                    border: 1px solid #D97706;
+                    border-left: 4px solid #D97706;
+                    border-radius: 8px;
+                    padding: 12px 16px;
+                    color: var(--text-color);
+                    font-size: 14px;
+                    line-height: 1.6;
+                    margin-bottom: 12px;
+                ">
+                    <strong style="color: #D97706;">S3-only mode</strong>
+                    <span> — The queue will export to S3 and stop there.
+                    The Redshift COPY step will be skipped.
+                    Change the <strong>Pipeline Destination</strong>
+                    dropdown above to enable the full pipeline.</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
         else:
-            src_schema_opts = st.session_state.sf_schemas if st.session_state.sf_connected else ["— connect first —"]
-        sf_schema = st.selectbox("Schema", src_schema_opts, key="sf_schema_sel")
+            st.markdown(
+                """
+                <div style="
+                    background: var(--secondary-background-color);
+                    border: 1px solid #16A34A;
+                    border-left: 4px solid #16A34A;
+                    border-radius: 8px;
+                    padding: 12px 16px;
+                    color: var(--text-color);
+                    font-size: 14px;
+                    line-height: 1.6;
+                    margin-bottom: 12px;
+                ">
+                    <strong style="color: #16A34A;">Full pipeline mode</strong>
+                    <span> — The queue will run
+                    Snowflake → S3 → Redshift COPY.</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        # Tables for selected schema — multiselect
-        _src_connected = st.session_state.db_connected if _source_type == "Databricks" else st.session_state.sf_connected
-        if _src_connected and sf_schema and sf_schema not in ("— connect first —",):
+        col_left, col_right = st.columns([1, 1], gap="large")
+
+        with col_left:
+            st.markdown(f'<div class="card-title">🗂 Source — {_source_type}</div>', unsafe_allow_html=True)
+
+            # Schema picker
             if _source_type == "Databricks":
-                tables_map = st.session_state.get("_db_tables_map", {})
-                if tables_map and sf_schema in tables_map:
-                    sf_table_opts = tables_map.get(sf_schema, [])
-                else:
-                    try:
-                        tbl_ref = get_databricks_table_ref(sf_schema, "*", _db_cfg.get("catalog")).rsplit(".", 1)[0]
-                        _r, _ = run_databricks_query(_db_cfg, f"SHOW TABLES IN {tbl_ref}")
-                        sf_table_opts = [r[1] for r in _r]
-                    except Exception:
+                src_schema_opts = st.session_state.db_schemas if st.session_state.db_connected else ["— connect first —"]
+            else:
+                src_schema_opts = st.session_state.sf_schemas if st.session_state.sf_connected else ["— connect first —"]
+            sf_schema = st.selectbox("Schema", src_schema_opts, key="sf_schema_sel")
+
+            # Tables for selected schema — multiselect
+            _src_connected = st.session_state.db_connected if _source_type == "Databricks" else st.session_state.sf_connected
+            if _src_connected and sf_schema and sf_schema not in ("— connect first —",):
+                if _source_type == "Databricks":
+                    tables_map = st.session_state.get("_db_tables_map", {})
+                    if tables_map and sf_schema in tables_map:
+                        sf_table_opts = tables_map.get(sf_schema, [])
+                    else:
                         try:
-                            _r, _ = run_databricks_query(_db_cfg, f"SHOW TABLES IN `{sf_schema}`")
+                            tbl_ref = get_databricks_table_ref(sf_schema, "*", _db_cfg.get("catalog")).rsplit(".", 1)[0]
+                            _r, _ = run_databricks_query(_db_cfg, f"SHOW TABLES IN {tbl_ref}")
                             sf_table_opts = [r[1] for r in _r]
                         except Exception:
-                            sf_table_opts = []
-                st.session_state.db_tables = sf_table_opts
-            else:
-                tables_map = st.session_state.get("_sf_tables_map", {})
-                if tables_map:
-                    sf_table_opts = tables_map.get(sf_schema, [])
+                            try:
+                                _r, _ = run_databricks_query(_db_cfg, f"SHOW TABLES IN `{sf_schema}`")
+                                sf_table_opts = [r[1] for r in _r]
+                            except Exception:
+                                sf_table_opts = []
+                    st.session_state.db_tables = sf_table_opts
                 else:
-                    result = get_snowflake_tables(_sf_cfg, sf_schema)
-                    sf_table_opts = result if result else []
-                st.session_state.sf_tables = sf_table_opts
-        else:
-            sf_table_opts = []
-
-        sf_tables_selected = st.multiselect(
-            "Tables  (select one or more)",
-            options=sf_table_opts,
-            default=st.session_state.get("sf_tables_selected", []),
-            placeholder="Choose tables…",
-            key="sf_table_multisel",
-        )
-        st.session_state["sf_tables_selected"] = sf_tables_selected
-
-        # For backwards-compat with single-table references elsewhere
-        sf_table = sf_tables_selected[0] if sf_tables_selected else "— select table —"
-
-        if len(sf_tables_selected) > 1:
-            st.markdown(
-                f'<span class="badge badge-pending">◌ Batch mode — {len(sf_tables_selected)} tables · same export settings applied to all</span>',
-                unsafe_allow_html=True,
-            )
-
-        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
-
-        custom_query = st.checkbox("Use custom SQL query", key="sf_custom_sql", disabled=len(sf_tables_selected) > 1,
-                                   help="Custom SQL is only available when a single table is selected.")
-        if custom_query and len(sf_tables_selected) == 1:
-            sql_query = st.text_area(
-                "SQL Query",
-                value=f"SELECT * FROM {sf_schema}.{sf_table}\nLIMIT 1000000",
-                height=100,
-                key="sf_sql_query",
-            )
-        else:
-            sql_query = None  # batch: each table gets SELECT * FROM schema.table
-
-        row_limit = st.number_input("Row limit per table (0 = all rows)", min_value=0, value=0, key="sf_row_limit")
-
-    with col_right:
-        st.markdown(f'<div class="card-title">{_brand_icon("s3")} Target — Amazon S3</div>', unsafe_allow_html=True)
-
-        file_format = st.selectbox("File Format", ["CSV", "Parquet", "Iceberg", "JSON", "ORC"], key="s3_file_format")
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if file_format == "CSV":
-                delimiter = st.selectbox("Field Delimiter", [",  (comma)", "|  (pipe)", "\\t  (tab)", ";  (semicolon)"], key="s3_delimiter")
-                delim_map = {",  (comma)": ",", "|  (pipe)": "|", "\\t  (tab)": "\t", ";  (semicolon)": ";"}
-                actual_delimiter = delim_map[delimiter]
+                    tables_map = st.session_state.get("_sf_tables_map", {})
+                    if tables_map:
+                        sf_table_opts = tables_map.get(sf_schema, [])
+                    else:
+                        result = get_snowflake_tables(_sf_cfg, sf_schema)
+                        sf_table_opts = result if result else []
+                    st.session_state.sf_tables = sf_table_opts
             else:
-                st.info(f"{file_format} uses native encoding.")
-        with col_b:
-            skip_header = st.checkbox("Include header row", value=True, key="s3_header")
-            compress    = st.checkbox("GZIP compression (Parquet/JSON only)", value=False, key="s3_gzip", help="CSV compression disabled — Redshift requires uncompressed CSV for reliable COPY")
+                sf_table_opts = []
 
-        quote_char = st.selectbox("Quote Character", ['"  (double)', "'  (single)", "None"], key="s3_quote") if file_format == "CSV" else None
-
-        # ── Iceberg info banner ───────────────────────────────────────────────
-        if file_format == "Iceberg":
-            st.markdown(
-                '<div style="background:#162040;border:1px solid #2a4080;border-radius:10px;'
-                'padding:12px 16px;margin-top:8px">'
-                '<div style="color:#7aa8f5;font-size:13px;font-weight:600;margin-bottom:4px">'
-                f'{_brand_icon("iceberg")} Iceberg Format Selected</div>'
-                '<div style="color:#8891a8;font-size:12px;line-height:1.7">'
-                'Data will be written to S3 as an Apache Iceberg table using <code>pyiceberg</code> and AWS Glue.<br>'
-                'Layout: <code>s3://bucket/prefix/SCHEMA/TABLE/metadata/</code> + <code>data/</code><br>'
-                '⚠ AWS credentials require Glue database/table permissions in addition to S3 access.<br>'
-                '⚠ Use the Job Queue engine (Advanced expander below) for Iceberg exports.'
-                '</div></div>',
-                unsafe_allow_html=True,
+            sf_tables_selected = st.multiselect(
+                "Tables  (select one or more)",
+                options=sf_table_opts,
+                default=st.session_state.get("sf_tables_selected", []),
+                placeholder="Choose tables…",
+                key="sf_table_multisel",
             )
+            st.session_state["sf_tables_selected"] = sf_tables_selected
 
-        if len(sf_tables_selected) <= 1:
-            s3_filename = st.text_input(
-                "Output filename",
-                value=f"{sf_table.lower() if sf_table not in ['— select table —','— connect first —'] else 'output'}_{datetime.now().strftime('%Y%m%d')}.{file_format.lower()}",
-                key="s3_filename",
-            )
-        else:
-            st.info(f"Batch mode: each table will be exported as `<table_name>_{datetime.now().strftime('%Y%m%d')}.{file_format.lower()}` under the configured S3 prefix.")
-            s3_filename = None
+            # For backwards-compat with single-table references elsewhere
+            sf_table = sf_tables_selected[0] if sf_tables_selected else "— select table —"
 
-        encoding = st.selectbox("Encoding", ["UTF-8", "UTF-16", "ISO-8859-1"], key="s3_encoding") if file_format == "CSV" else None
-        null_string = st.text_input("NULL represented as", value="", placeholder='e.g. \\N or empty', key="s3_null_str") if file_format == "CSV" else None
+            if len(sf_tables_selected) > 1:
+                st.markdown(
+                    f'<span class="badge badge-pending">◌ Batch mode — {len(sf_tables_selected)} tables · same export settings applied to all</span>',
+                    unsafe_allow_html=True,
+                )
 
-    st.markdown("---")
+            st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
 
-    # ── Run button ────────────────────────────────────────────────────────────
-    run_col, status_col = st.columns([2, 5])
-    with run_col:
-        run_sf_export = st.button("▶ Export to S3", key="btn_sf_export", use_container_width=True)
+            custom_query = st.checkbox("Use custom SQL query", key="sf_custom_sql", disabled=len(sf_tables_selected) > 1,
+                                       help="Custom SQL is only available when a single table is selected.")
+            if custom_query and len(sf_tables_selected) == 1:
+                sql_query = st.text_area(
+                    "SQL Query",
+                    value=f"SELECT * FROM {sf_schema}.{sf_table}\nLIMIT 1000000",
+                    height=100,
+                    key="sf_sql_query",
+                )
+            else:
+                sql_query = None  # batch: each table gets SELECT * FROM schema.table
 
-    if run_sf_export:
-        _src_connected = st.session_state.db_connected if _source_type == "Databricks" else st.session_state.sf_connected
-        if not sf_tables_selected:
-            st.error("Please select at least one table before running.")
-        elif not _src_connected:
-            st.error(f"{_source_type} is not connected. Please connect via the sidebar first.")
-        else:
-            add_log(f"Starting export · {len(sf_tables_selected)} table(s) → S3 ({_source_type})", "info")
-            progress = st.progress(0, text="Preparing export…")
-            all_ok = True
+            row_limit = st.number_input("Row limit per table (0 = all rows)", min_value=0, value=0, key="sf_row_limit")
 
-            for i, tbl in enumerate(sf_tables_selected):
-                progress.progress((i) / len(sf_tables_selected), text=f"Exporting {tbl}…")
-                try:
-                    import boto3, io
+        with col_right:
+            st.markdown(f'<div class="card-title">{_brand_icon("s3")} Target — Amazon S3</div>', unsafe_allow_html=True)
 
-                    if _source_type == "Databricks":
-                        if sql_query and len(sf_tables_selected) == 1:
-                            query = sql_query
-                        else:
-                            tbl_ref = get_databricks_table_ref(sf_schema, tbl, _db_cfg.get("catalog"))
-                            query = f"SELECT * FROM {tbl_ref}"
-                            if row_limit and row_limit > 0:
-                                query += f" LIMIT {row_limit}"
-                        try:
-                            rows, col_names = run_databricks_query(_db_cfg, query)
-                        except Exception as _q_err:
-                            if "UC_HIVE_METASTORE_DISABLED_EXCEPTION" in str(_q_err) or "hive_metastore" in str(_q_err).lower():
-                                # Fall back to 2-part name without catalog qualification
-                                query = f"SELECT * FROM `{sf_schema}`.`{tbl}`"
+            file_format = st.selectbox("File Format", ["CSV", "Parquet", "Iceberg", "JSON", "ORC"], key="s3_file_format")
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if file_format == "CSV":
+                    delimiter = st.selectbox("Field Delimiter", [",  (comma)", "|  (pipe)", "\\t  (tab)", ";  (semicolon)"], key="s3_delimiter")
+                    delim_map = {",  (comma)": ",", "|  (pipe)": "|", "\\t  (tab)": "\t", ";  (semicolon)": ";"}
+                    actual_delimiter = delim_map[delimiter]
+                else:
+                    st.info(f"{file_format} uses native encoding.")
+            with col_b:
+                skip_header = st.checkbox("Include header row", value=True, key="s3_header")
+                compress    = st.checkbox("GZIP compression (Parquet/JSON only)", value=False, key="s3_gzip", help="CSV compression disabled — Redshift requires uncompressed CSV for reliable COPY")
+
+            quote_char = st.selectbox("Quote Character", ['"  (double)', "'  (single)", "None"], key="s3_quote") if file_format == "CSV" else None
+
+            # ── Iceberg info banner ───────────────────────────────────────────────
+            if file_format == "Iceberg":
+                st.markdown(
+                    '<div style="background:#162040;border:1px solid #2a4080;border-radius:10px;'
+                    'padding:12px 16px;margin-top:8px">'
+                    '<div style="color:#7aa8f5;font-size:13px;font-weight:600;margin-bottom:4px">'
+                    f'{_brand_icon("iceberg")} Iceberg Format Selected</div>'
+                    '<div style="color:#8891a8;font-size:12px;line-height:1.7">'
+                    'Data will be written to S3 as an Apache Iceberg table using <code>pyiceberg</code> and AWS Glue.<br>'
+                    'Layout: <code>s3://bucket/prefix/SCHEMA/TABLE/metadata/</code> + <code>data/</code><br>'
+                    '⚠ AWS credentials require Glue database/table permissions in addition to S3 access.<br>'
+                    '⚠ Use the Job Queue engine (Advanced expander below) for Iceberg exports.'
+                    '</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+            if len(sf_tables_selected) <= 1:
+                s3_filename = st.text_input(
+                    "Output filename",
+                    value=f"{sf_table.lower() if sf_table not in ['— select table —','— connect first —'] else 'output'}_{datetime.now().strftime('%Y%m%d')}.{file_format.lower()}",
+                    key="s3_filename",
+                )
+            else:
+                st.info(f"Batch mode: each table will be exported as `<table_name>_{datetime.now().strftime('%Y%m%d')}.{file_format.lower()}` under the configured S3 prefix.")
+                s3_filename = None
+
+            encoding = st.selectbox("Encoding", ["UTF-8", "UTF-16", "ISO-8859-1"], key="s3_encoding") if file_format == "CSV" else None
+            null_string = st.text_input("NULL represented as", value="", placeholder='e.g. \\N or empty', key="s3_null_str") if file_format == "CSV" else None
+
+        st.markdown("---")
+
+        # ── Run button ────────────────────────────────────────────────────────────
+        run_col, status_col = st.columns([2, 5])
+        with run_col:
+            run_sf_export = st.button("▶ Export to S3", key="btn_sf_export", use_container_width=True)
+
+        if run_sf_export:
+            _src_connected = st.session_state.db_connected if _source_type == "Databricks" else st.session_state.sf_connected
+            if not sf_tables_selected:
+                st.error("Please select at least one table before running.")
+            elif not _src_connected:
+                st.error(f"{_source_type} is not connected. Please connect via the sidebar first.")
+            else:
+                add_log(f"Starting export · {len(sf_tables_selected)} table(s) → S3 ({_source_type})", "info")
+                progress = st.progress(0, text="Preparing export…")
+                all_ok = True
+
+                for i, tbl in enumerate(sf_tables_selected):
+                    progress.progress((i) / len(sf_tables_selected), text=f"Exporting {tbl}…")
+                    try:
+                        import boto3, io
+
+                        if _source_type == "Databricks":
+                            if sql_query and len(sf_tables_selected) == 1:
+                                query = sql_query
+                            else:
+                                tbl_ref = get_databricks_table_ref(sf_schema, tbl, _db_cfg.get("catalog"))
+                                query = f"SELECT * FROM {tbl_ref}"
                                 if row_limit and row_limit > 0:
                                     query += f" LIMIT {row_limit}"
+                            try:
                                 rows, col_names = run_databricks_query(_db_cfg, query)
+                            except Exception as _q_err:
+                                if "UC_HIVE_METASTORE_DISABLED_EXCEPTION" in str(_q_err) or "hive_metastore" in str(_q_err).lower():
+                                    # Fall back to 2-part name without catalog qualification
+                                    query = f"SELECT * FROM `{sf_schema}`.`{tbl}`"
+                                    if row_limit and row_limit > 0:
+                                        query += f" LIMIT {row_limit}"
+                                    rows, col_names = run_databricks_query(_db_cfg, query)
+                                else:
+                                    raise
+                        else:
+                            import snowflake.connector
+                            if sql_query and len(sf_tables_selected) == 1:
+                                query = sql_query
                             else:
-                                raise
-                    else:
-                        import snowflake.connector
-                        if sql_query and len(sf_tables_selected) == 1:
-                            query = sql_query
+                                query = f'SELECT * FROM {sf_schema}."{tbl}"'
+                                if row_limit and row_limit > 0:
+                                    query += f" LIMIT {row_limit}"
+
+                            conn = snowflake.connector.connect(**_sf_cfg)
+                            cur = conn.cursor()
+                            cur.execute(query)
+                            rows = cur.fetchall()
+                            col_names = [d[0] for d in cur.description]
+                            cur.close()
+                            conn.close()
+
+                        # Determine output filename
+                        ts_now = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        fname = s3_filename if (s3_filename and len(sf_tables_selected) == 1) else \
+                            f"{tbl.upper()}_{ts_now}.{file_format.lower()}"
+                        # Serialise
+                        if file_format == "CSV":
+                            import csv
+                            buf = io.StringIO()
+                            writer = csv.writer(
+                                buf,
+                                delimiter=",",
+                                quotechar='"',
+                                quoting=csv.QUOTE_ALL,
+                                lineterminator="\n",
+                            )
+                            writer.writerow(col_names)
+                            for row in rows:
+                                writer.writerow(["" if v is None else v for v in row])
+                            body = buf.getvalue().encode("utf-8")
+                        elif file_format == "Iceberg":
+                            import mmh3_compat
+                            if _source_type == "Databricks":
+                                from chunk_02_job_queue_engine import _extract_databricks_to_s3_iceberg
+                                _iceberg_job = {
+                                    "source_schema": sf_schema,
+                                    "source_table":  tbl,
+                                    "sf_schema":     sf_schema,
+                                    "sf_table":      tbl,
+                                    "file_format":   "Iceberg",
+                                    "source_query":  query,
+                                    "use_filters":   False,
+                                    "filter_col":    "",
+                                }
+                                _result = _extract_databricks_to_s3_iceberg(_iceberg_job, _db_cfg, _s3_cfg)
+                            else:
+                                from chunk_02_job_queue_engine import _extract_snowflake_to_s3_iceberg
+                                _iceberg_job = {
+                                    "sf_schema":    sf_schema,
+                                    "sf_table":     tbl,
+                                    "file_format":  "Iceberg",
+                                    "source_query": query,
+                                    "use_filters":  False,
+                                    "filter_col":   "",
+                                }
+                                _result = _extract_snowflake_to_s3_iceberg(_iceberg_job, _sf_cfg, _s3_cfg)
+
+                            s3_key = _result.get("s3_key") or f"{_s3_cfg['prefix'].strip('/')}/{sf_schema.lower()}/{tbl.lower()}/".lstrip("/")
+                            add_log(
+                                f"✓ {tbl} → s3://{_s3_cfg['bucket']}/{s3_key} "
+                                f"({_result['rows']:,} rows · Apache Iceberg format)", "ok"
+                            )
+                            # sync s3_key back into job_queue
+                            for _job in st.session_state.get("job_queue", []):
+                                if _job.get("sf_table", "").upper() == tbl.upper():
+                                    _job["s3_key"] = s3_key
+                                    break
+                            continue  # skip the put_object path below
+                        elif file_format == "Parquet":
+                            import pyarrow as pa
+                            import pyarrow.parquet as pq
+                            df = pd.DataFrame(rows, columns=col_names)
+                            pq_buf = io.BytesIO()
+                            pq.write_table(pa.Table.from_pandas(df, preserve_index=False), pq_buf,
+                                           compression="gzip" if compress else "snappy",
+                                           coerce_timestamps="us", version="1.0")
+                            body = pq_buf.getvalue()
+                        elif file_format == "ORC":
+                            import pyarrow as pa
+                            import pyarrow.orc as orc
+                            orc_buf = io.BytesIO()
+                            table = pa.Table.from_pandas(pd.DataFrame(rows, columns=col_names), preserve_index=False)
+                            table = table.cast(pa.schema([pa.field(f.name, pa.string() if pa.types.is_null(f.type) else f.type)
+                                                          for f in table.schema]))
+                            orc.write_table(table, orc_buf)
+                            body = orc_buf.getvalue()
                         else:
-                            query = f'SELECT * FROM {sf_schema}."{tbl}"'
-                            if row_limit and row_limit > 0:
-                                query += f" LIMIT {row_limit}"
+                            import json, pandas as pd
+                            df = pd.DataFrame(rows, columns=col_names)
+                            body = df.to_json(orient="records", lines=True,
+                                              date_format="iso", date_unit="us").encode("utf-8")
 
-                        conn = snowflake.connector.connect(**_sf_cfg)
-                        cur = conn.cursor()
-                        cur.execute(query)
-                        rows = cur.fetchall()
-                        col_names = [d[0] for d in cur.description]
-                        cur.close()
-                        conn.close()
+                        if compress and file_format == "JSON":
+                            import gzip
+                            body = gzip.compress(body)
+                            if not fname.endswith(".gz"):
+                                fname += ".gz"
 
-                    # Determine output filename
-                    ts_now = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    fname = s3_filename if (s3_filename and len(sf_tables_selected) == 1) else \
-                        f"{tbl.upper()}_{ts_now}.{file_format.lower()}"
-                    # Serialise
-                    if file_format == "CSV":
-                        import csv
-                        buf = io.StringIO()
-                        writer = csv.writer(
-                            buf,
-                            delimiter=",",
-                            quotechar='"',
-                            quoting=csv.QUOTE_ALL,
-                            lineterminator="\n",
+                        # Upload to S3
+                        s3_client = boto3.client(
+                            "s3",
+                            aws_access_key_id=_s3_cfg["access_key"],
+                            aws_secret_access_key=_s3_cfg["secret_key"],
+                            region_name=_s3_cfg["region"],
                         )
-                        writer.writerow(col_names)
-                        for row in rows:
-                            writer.writerow(["" if v is None else v for v in row])
-                        body = buf.getvalue().encode("utf-8")
-                    elif file_format == "Iceberg":
-                        import mmh3_compat
-                        if _source_type == "Databricks":
-                            from chunk_02_job_queue_engine import _extract_databricks_to_s3_iceberg
-                            _iceberg_job = {
-                                "source_schema": sf_schema,
-                                "source_table":  tbl,
-                                "sf_schema":     sf_schema,
-                                "sf_table":      tbl,
-                                "file_format":   "Iceberg",
-                                "source_query":  query,
-                                "use_filters":   False,
-                                "filter_col":    "",
-                            }
-                            _result = _extract_databricks_to_s3_iceberg(_iceberg_job, _db_cfg, _s3_cfg)
-                        else:
-                            from chunk_02_job_queue_engine import _extract_snowflake_to_s3_iceberg
-                            _iceberg_job = {
-                                "sf_schema":    sf_schema,
-                                "sf_table":     tbl,
-                                "file_format":  "Iceberg",
-                                "source_query": query,
-                                "use_filters":  False,
-                                "filter_col":   "",
-                            }
-                            _result = _extract_snowflake_to_s3_iceberg(_iceberg_job, _sf_cfg, _s3_cfg)
+                        s3_key = f"{_s3_cfg['prefix'].rstrip('/')}/{sf_schema}/{fname}"
+                        s3_client.put_object(Bucket=_s3_cfg["bucket"], Key=s3_key, Body=body)
 
-                        s3_key = _result.get("s3_key") or f"{_s3_cfg['prefix'].strip('/')}/{sf_schema.lower()}/{tbl.lower()}/".lstrip("/")
-                        add_log(
-                            f"✓ {tbl} → s3://{_s3_cfg['bucket']}/{s3_key} "
-                            f"({_result['rows']:,} rows · Apache Iceberg format)", "ok"
-                        )
-                        # sync s3_key back into job_queue
+                        # Sync s3_key back into job_queue so COPY uses the exact uploaded path
                         for _job in st.session_state.get("job_queue", []):
                             if _job.get("sf_table", "").upper() == tbl.upper():
                                 _job["s3_key"] = s3_key
                                 break
-                        continue  # skip the put_object path below
-                    elif file_format == "Parquet":
-                        import io, fastparquet, pandas as pd
-                        df = pd.DataFrame(rows, columns=col_names)
-                        pq_buf = io.BytesIO()
-                        fastparquet.write(pq_buf, df, compression="snappy")
-                        body = pq_buf.getvalue()
-                    else:
-                        import json, pandas as pd
-                        df = pd.DataFrame(rows, columns=col_names)
-                        body = df.to_json(orient="records", lines=True).encode("utf-8")
 
-                    if compress and file_format != "CSV":
-                        import gzip
-                        body = gzip.compress(body)
-                        if not fname.endswith(".gz"):
-                            fname += ".gz"
+                        add_log(f"✓ {tbl} → s3://{_s3_cfg['bucket']}/{s3_key} ({len(rows):,} rows)", "ok")
 
-                    # Upload to S3
-                    s3_client = boto3.client(
-                        "s3",
-                        aws_access_key_id=_s3_cfg["access_key"],
-                        aws_secret_access_key=_s3_cfg["secret_key"],
-                        region_name=_s3_cfg["region"],
-                    )
-                    s3_key = f"{_s3_cfg['prefix'].rstrip('/')}/{sf_schema}/{fname}"
-                    s3_client.put_object(Bucket=_s3_cfg["bucket"], Key=s3_key, Body=body)
+                    except Exception as exc:
+                        add_log(f"✗ {tbl}: {exc}", "err")
+                        st.error(f"Export failed for {tbl}: {exc}")
+                        all_ok = False
 
-                    # Sync s3_key back into job_queue so COPY uses the exact uploaded path
-                    for _job in st.session_state.get("job_queue", []):
-                        if _job.get("sf_table", "").upper() == tbl.upper():
-                            _job["s3_key"] = s3_key
-                            break
+                progress.progress(1.0, text="Done!")
+                if all_ok:
+                    st.success(f"✅ {len(sf_tables_selected)} table(s) exported to S3 successfully.")
+                else:
+                    st.warning("Export completed with some errors — check the logs.")
 
-                    add_log(f"✓ {tbl} → s3://{_s3_cfg['bucket']}/{s3_key} ({len(rows):,} rows)", "ok")
-
-                except Exception as exc:
-                    add_log(f"✗ {tbl}: {exc}", "err")
-                    st.error(f"Export failed for {tbl}: {exc}")
-                    all_ok = False
-
-            progress.progress(1.0, text="Done!")
-            if all_ok:
-                st.success(f"✅ {len(sf_tables_selected)} table(s) exported to S3 successfully.")
-            else:
-                st.warning("Export completed with some errors — check the logs.")
-
-    # ── Execution controls (Chunk 2 — job queue) ──────────────────────────────
-    _jq_label = (
-        "⚙️ Advanced — Job Queue Engine  (Source → S3 only · Redshift COPY skipped)"
-        if _s3_only else
-        "⚙️ Advanced — Job Queue Engine  (Source → S3 → Redshift)"
-    )
-    with st.expander(_jq_label, expanded=False):
-        if _s3_only:
-            st.markdown(
-                '<div style="background:#2a2010;border:1px solid #78350f;border-radius:8px;'
-                'padding:8px 14px;color:#fbbf24;font-size:12px;margin-bottom:10px">'
-                '◌ <b>S3-only mode</b> — the queue runner will execute the source → S3 export '
-                'for each job and <b>skip the Redshift COPY step</b>. '
-                'Switch the Pipeline Destination to "Source → S3 → Redshift" to enable COPY.</div>',
-                unsafe_allow_html=True,
-            )
-        render_execution_controls(
-            sf_cfg=_sf_cfg,
-            s3_cfg=_s3_cfg,
-            rs_cfg=_rs_cfg,
-            db_cfg=_db_cfg,
-            source_type=_source_type,
+        # ── Execution controls (Chunk 2 — job queue) ──────────────────────────────
+        _jq_label = (
+            "⚙️ Advanced — Job Queue Engine  (Source → S3 only · Redshift COPY skipped)"
+            if _s3_only else
+            "⚙️ Advanced — Job Queue Engine  (Source → S3 → Redshift)"
         )
+        with st.expander(_jq_label, expanded=False):
+            if _s3_only:
+                st.markdown(
+                    '<div style="background:#2a2010;border:1px solid #78350f;border-radius:8px;'
+                    'padding:8px 14px;color:#fbbf24;font-size:12px;margin-bottom:10px">'
+                    '◌ <b>S3-only mode</b> — the queue runner will execute the source → S3 export '
+                    'for each job and <b>skip the Redshift COPY step</b>. '
+                    'Switch the Pipeline Destination to "Source → S3 → Redshift" to enable COPY.</div>',
+                    unsafe_allow_html=True,
+                )
+            render_execution_controls(
+                sf_cfg=_sf_cfg,
+                s3_cfg=_s3_cfg,
+                rs_cfg=_rs_cfg,
+                db_cfg=_db_cfg,
+                source_type=_source_type,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1925,7 +1923,7 @@ with tab2, tab_loading():
             else:
                 t2_delimiter = t2_skip_header = t2_null_as = t2_encoding = t2_date_fmt = None
 
-            t2_max_error  = st.number_input("MAXERROR tolerance", 0, 10000, 10, key="t2_maxerror")
+            t2_max_error  = st.number_input("MAXERROR tolerance", 0, 10000, 0, key="t2_maxerror")
             t2_compupdate = st.checkbox("COMPUPDATE ON", value=True, key="t2_compupdate")
             t2_statupdate = st.checkbox("STATUPDATE ON", value=True, key="t2_statupdate")
 
@@ -2078,8 +2076,12 @@ with tab2, tab_loading():
                     except Exception as copy_err:
                         failed.append((fname, str(copy_err)))
                         add_log(f"✗ COPY failed {fname}: {copy_err}", "err")
+                        break
 
-                progress_bar.progress(1.0, text="Done!")
+                processed = len(succeeded) + len(skipped) + len(failed)
+                pending = len(t2_selected_entries) - processed
+                progress_bar.progress(processed / len(t2_selected_entries),
+                                      text=f"Stopped after load failure · {pending} pending" if failed else "Finished")
 
                 # ── Results summary ───────────────────────────────────────────────
                 st.markdown("---")
@@ -2100,6 +2102,8 @@ with tab2, tab_loading():
                 if failed:
                     st.error(f"❌ {len(failed)} file(s) failed:")
                     st.dataframe(pd.DataFrame(failed, columns=["File", "Error"]), use_container_width=True, hide_index=True)
+                    if pending:
+                        st.warning(f"{pending} file(s) were not attempted because loading stopped at the first failure.")
     # ─────────────────────────────────────────────────────────────────────────────
     # TAB 3 · Monitor  (Chunk 3)
     # ─────────────────────────────────────────────────────────────────────────────

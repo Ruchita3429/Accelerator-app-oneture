@@ -15,7 +15,7 @@ For each table it:
   2. Extracts from Snowflake and uploads to S3
   3. Issues COPY into Redshift
   4. Marks job "done" or "failed" with metrics
-  5. Writes a checkpoint file so the run is resumable if interrupted
+  5. Records a checkpoint in session state for retries in the same session
 
 PLUG-IN point (for Assembly — Chunk 5)
 ---------------------------------------
@@ -44,17 +44,8 @@ CHECKPOINT LOGIC
 ----------------
 A checkpoint dict is maintained in session state keyed by job id.
 On resume, any job whose id is already "done" in the checkpoint is skipped.
-This means if the app restarts mid-run, re-clicking Run resumes from the
-last incomplete table rather than starting over.
-
-REAL CONNECTOR HOOKS
---------------------
-Two functions are clearly marked for real implementation:
-  _extract_snowflake_to_s3(job, sf_cfg, s3_cfg)   → replace mock with real
-  _load_s3_to_redshift(job, s3_cfg, rs_cfg)        → replace mock with real
-
-Both currently simulate work with realistic timing and fake metrics so the
-UI demoes correctly without live credentials.
+Checkpoints do not survive an application restart. Source and load errors
+are reported as failures; source errors never generate replacement data.
 """
 
 # ── Compatibility Shims ───────────────────────────────────────────────────────
@@ -63,19 +54,9 @@ import pyarrow_compat   # Stubs pyarrow._compute + pyarrow._dataset before panda
 
 import streamlit as st
 import time
-import random
 from datetime import datetime
 
-# ── BigQuery route helpers (optional — only needed when BQ is the source) ────
-try:
-    from pipeline_routes import is_bigquery, s3_only, source_name, formats_for
-    _BQ_ROUTES_AVAILABLE = True
-except ImportError:
-    _BQ_ROUTES_AVAILABLE = False
-    def is_bigquery(route): return False
-    def s3_only(route): return "s3 only" in (route or "").lower()
-    def source_name(job): return f"{job.get('sf_schema','')}.{job.get('sf_table','')}"
-    def formats_for(route): return ["CSV", "Parquet", "Iceberg", "JSON", "ORC"]
+from pipeline_routes import is_bigquery, s3_only, source_name, formats_for, resolve_route
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,7 +184,7 @@ def _extract_databricks_to_s3_iceberg(job: dict, db_cfg: dict, s3_cfg: dict) -> 
     Export a Databricks table to S3 in Apache Iceberg format.
 
     Flow:
-      1. Fetch rows from Databricks (cursor.fetchall) or graceful fallback
+      1. Fetch rows from Databricks (cursor.fetchall); stop on source errors
       2. Convert to a PyArrow Table
       3. Register and write the table through AWS Glue using pyiceberg
     """
@@ -270,13 +251,7 @@ def _extract_databricks_to_s3_iceberg(job: dict, db_cfg: dict, s3_cfg: dict) -> 
         cur.close()
         conn.close()
     except Exception as exc:
-        _log(f"Databricks query notice: {exc} — generating sample data for Iceberg export", "warn")
-        col_names = ["ID", "NAME", "CATEGORY", "AMOUNT", "UPDATED_AT"]
-        import datetime as _dt
-        rows = [
-            (i, f"Item_{i}", f"Category_{i%5}", round(10.5 * i, 2), _dt.datetime.now())
-            for i in range(1, 101)
-        ]
+        raise RuntimeError(f"Databricks read failed for {db_schema}.{db_table}: {exc}") from exc
 
     total_rows = len(rows)
     _log(f"Iceberg export: fetched {total_rows:,} rows from Databricks")
@@ -352,23 +327,29 @@ def _extract_databricks_to_s3(job: dict, db_cfg: dict, s3_cfg: dict) -> dict:
         cur.close()
         conn.close()
     except Exception as exc:
-        _log(f"Databricks query notice: {exc} — generating sample data for export", "warn")
-        col_names = ["ID", "NAME", "CATEGORY", "AMOUNT"]
-        rows = [
-            (i, f"Item_{i}", f"Category_{i%5}", round(10.5 * i, 2))
-            for i in range(1, 101)
-        ]
+        raise RuntimeError(f"Databricks read failed for {db_schema}.{db_table}: {exc}") from exc
 
     df = pd.DataFrame(rows, columns=col_names)
     job["columns"] = list(df.columns)
     job["dtypes"] = {c: str(df[c].dtype) for c in df.columns}
     if fmt == "PARQUET":
-        import fastparquet
+        import pyarrow as pa
+        import pyarrow.parquet as pq
         pq_buf = io.BytesIO()
-        fastparquet.write(pq_buf, df, compression="snappy")
+        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), pq_buf,
+                       compression="snappy", coerce_timestamps="us", version="1.0")
         body = pq_buf.getvalue()
+    elif fmt == "ORC":
+        import pyarrow as pa
+        import pyarrow.orc as orc
+        orc_buf = io.BytesIO()
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        table = table.cast(pa.schema([pa.field(f.name, pa.string() if pa.types.is_null(f.type) else f.type)
+                                      for f in table.schema]))
+        orc.write_table(table, orc_buf)
+        body = orc_buf.getvalue()
     elif fmt == "JSON":
-        body = df.to_json(orient="records", lines=True).encode("utf-8")
+        body = df.to_json(orient="records", lines=True, date_format="iso", date_unit="us").encode("utf-8")
     else:
         csv_buf = io.StringIO()
         df.to_csv(csv_buf, index=False)
@@ -624,13 +605,17 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
         aws_secret_access_key=rs_cfg.get("secret_key") or s3_cfg.get("secret_key"),
     )
 
-    def _execute_sync(sql: str, timeout: int = 120):
-        resp = client.execute_statement(
-            WorkgroupName=rs_cfg["workgroup"],
-            Database=rs_cfg["database"],
-            Sql=sql,
-        )
-        s_id = resp["Id"]
+    def _execute_sync(sql: str, timeout: int = 120, statement_key=None):
+        s_id = job.get(statement_key) if statement_key else None
+        if not s_id:
+            resp = client.execute_statement(
+                WorkgroupName=rs_cfg["workgroup"],
+                Database=rs_cfg["database"],
+                Sql=sql,
+            )
+            s_id = resp["Id"]
+            if statement_key:
+                job[statement_key] = s_id
         dl = time.time() + timeout
         while time.time() < dl:
             d = client.describe_statement(Id=s_id)
@@ -638,6 +623,8 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
             if stt == "FINISHED":
                 return d
             if stt in ("FAILED", "ABORTED"):
+                if statement_key:
+                    job.pop(statement_key, None)
                 raise RuntimeError(f"{d.get('Error', 'Unknown statement error')}")
             time.sleep(1)
         raise TimeoutError(f"Redshift statement timed out after {timeout}s: {sql[:60]}")
@@ -745,15 +732,25 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
             table_exists = True
             _log(f"Created table '{rs_schema}.{rs_table}' successfully", "ok")
         except Exception as c_err:
-            _log(f"Notice during table create: {c_err}", "warn")
+            raise RuntimeError(f"Target table creation failed: {c_err}") from c_err
+
+    target = f'"{rs_schema}"."{rs_table}"'
+
+    def _target_count():
+        desc = _execute_sync(f'SELECT COUNT(*) FROM {target}', timeout=30)
+        result = client.get_statement_result(Id=desc["Id"])
+        return int(result["Records"][0][0]["longValue"])
+
+    if "target_rows_before" not in job:
+        job["target_rows_before"] = _target_count()
 
     # ── Handle TRUNCATE & LOAD ────────────────────────────────────────────────
-    if load_mode == "TRUNCATE & LOAD" and table_exists:
+    if load_mode == "TRUNCATE & LOAD" and not job.get("load_statement_id"):
         try:
-            _execute_sync(f'TRUNCATE TABLE "{rs_schema}"."{rs_table}"', timeout=30)
+            _execute_sync(f'TRUNCATE TABLE {target}', timeout=30, statement_key="truncate_statement_id")
             _log(f"Truncated existing table '{rs_schema}.{rs_table}' before loading", "info")
         except Exception as t_err:
-            _log(f"Notice during truncate: {t_err}", "warn")
+            raise RuntimeError(f"Target truncate failed; COPY was not started: {t_err}") from t_err
 
     # ── Construct Redshift COPY command ───────────────────────────────────────
     s3_bucket = s3_cfg["bucket"]
@@ -800,7 +797,7 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
         SECRET_ACCESS_KEY '{sk}'
         REGION '{s3_region}'
         {format_clause}
-        MAXERROR 10
+        MAXERROR 0
         COMPUPDATE ON STATUPDATE ON;
     """
 
@@ -808,7 +805,7 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
 
     start_time = time.time()
     try:
-        _execute_sync(copy_command, timeout=3600)
+        _execute_sync(copy_command, timeout=3600, statement_key="load_statement_id")
     except Exception as copy_err:
         err_str = str(copy_err)
         if "external schema" in err_str.lower():
@@ -826,14 +823,15 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
 
     duration = round(time.time() - start_time, 2)
 
-    # Fetch row count
-    rs_rows = 0
+    # Separate Data API calls do not share pg_last_copy_count() session state.
     try:
-        cnt_desc = _execute_sync("SELECT pg_last_copy_count()", timeout=30)
-        cnt_res = client.get_statement_result(Id=cnt_desc["Id"])
-        rs_rows = int(cnt_res["Records"][0][0].get("longValue", 0))
-    except Exception:
-        rs_rows = job.get("rows", 0)
+        job["target_rows_after"] = _target_count()
+    except Exception as exc:
+        raise RuntimeError(f"COPY finished but target row-count verification failed: {exc}") from exc
+    baseline = job["target_rows_before"] if load_mode == "APPEND" else 0
+    rs_rows = job["target_rows_after"] - baseline
+    if rs_rows != job["rows"]:
+        raise RuntimeError(f"Target row-count mismatch: expected {job['rows']} loaded rows, found {rs_rows}.")
 
     _log(f"Loaded {rs_rows:,} rows into Redshift table '{rs_schema}.{rs_table}' in {duration}s", "ok")
     return {
@@ -853,7 +851,7 @@ def run_migration(
     progress_placeholder,   # st.empty() — for overall progress bar
     status_placeholder,     # st.empty() — for current table status text
     db_cfg:   dict = None,
-    source_type: str = "Snowflake",
+    source_type: str = None,
 ):
     """
     Sequential executor — iterates job_queue and runs each table migration.
@@ -873,13 +871,22 @@ def run_migration(
     _init_checkpoint()
     queue = st.session_state.job_queue
     total = len(queue)
+    st.session_state.migration_summary = {}
+    st.session_state.migration_done = False
 
     if total == 0:
         st.warning("No jobs in queue. Go to the Table Discovery tab first.")
         return
 
-    route = st.session_state.get("pipeline_destination", "")
+    active_source = source_type or st.session_state.get("source_type", "Snowflake")
+    route = resolve_route(st.session_state.get("pipeline_destination", "Source → S3 → Redshift"), active_source)
     bq_run = is_bigquery(route)
+    if any(j.get("source_type", active_source).lower() != active_source.lower() for j in queue):
+        st.error("The queue belongs to another source. Rebuild it for the selected source.")
+        return False
+    if active_source.lower() == "databricks" and st.session_state.get("db_is_demo"):
+        st.error("Demo tables cannot be exported. Connect to a live Databricks source first.")
+        return False
 
     # ── BigQuery-specific pre-flight validation ──────────────────────────────
     if bq_run:
@@ -921,10 +928,8 @@ def run_migration(
         if _is_checkpointed(job["id"]):
             _log(f"[{idx+1}/{total}] SKIP (checkpointed) · {job['id']}", "info")
             completed += 1
-            # For BQ jobs the rows/bytes are stored on the job dict already
-            if bq_run:
-                total_rows  += job.get("rows", 0)
-                total_bytes += job.get("bytes", 0)
+            total_rows  += job.get("rows", 0)
+            total_bytes += job.get("bytes", 0)
             continue
 
         # ── Mark running ──
@@ -946,15 +951,13 @@ def run_migration(
             _log(f"[{idx+1}/{total}] Extract · {job['id']}", "info")
             job_src = job.get("source_type") or source_type or st.session_state.get("source_type", "Snowflake")
 
-            if job_src == "bigquery" or bq_run:
+            if job.get("export_complete"):
+                sf_result = {"rows": job["rows"], "bytes": job["bytes"]}
+            elif job_src.lower() == "bigquery" or bq_run:
                 # BigQuery → S3 export via bigquery_migration
                 from bigquery_migration import extract_to_s3 as _bq_extract
-                sf_result = (
-                    {"rows": job["rows"], "bytes": job["bytes"]}
-                    if job.get("export_complete")
-                    else _bq_extract(job, st.session_state.get("bq_client"), s3_cfg)
-                )
-            elif job_src == "Databricks":
+                sf_result = _bq_extract(job, st.session_state.get("bq_client"), s3_cfg)
+            elif job_src.lower() == "databricks":
                 sf_result = _extract_databricks_to_s3(job, db_cfg or {}, s3_cfg)
             else:
                 sf_result = _extract_snowflake_to_s3(job, sf_cfg or {}, s3_cfg)
@@ -963,6 +966,7 @@ def run_migration(
                 job["id"],
                 rows=sf_result["rows"],
                 bytes=sf_result["bytes"],
+                export_complete=True,
             )
         except Exception as e:
             err = f"{'BigQuery' if (bq_run or job.get('source_type') == 'bigquery') else 'Source'}→S3 failed: {e}"
@@ -975,7 +979,7 @@ def run_migration(
             continue
 
         # ── Phase 2: S3 → Redshift (skipped when pipeline_destination is S3-only) ──
-        if s3_only(route) or "s3 only" in route.lower():
+        if s3_only(route):
             _log(f"[{idx+1}/{total}] S3-only mode — Redshift COPY skipped · {job['id']}", "info")
             rs_result = {"rs_rows": 0, "rs_duration_secs": 0}
         else:
@@ -995,7 +999,7 @@ def run_migration(
                 failed += 1
                 overall_pct = int(((idx + 1) / total) * 100)
                 progress_placeholder.progress(overall_pct, text=f"Processing… {idx+1}/{total}")
-                continue
+                break
 
         # ── Mark done ──
         job_secs = round(time.time() - job_start, 2)
@@ -1027,15 +1031,21 @@ def run_migration(
         )
 
     # ── Wrap up ──────────────────────────────────────────────────────────────
+    # Include checkpointed jobs later in the queue when a failure stops a retry.
+    done_jobs = [j for j in queue if _is_checkpointed(j["id"])]
+    completed = len(done_jobs)
+    failed = sum(j.get("status") == "failed" for j in queue)
+    total_rows = sum(j.get("rows", 0) for j in done_jobs)
+    total_bytes = sum(j.get("bytes", 0) for j in done_jobs)
     wall_secs = round(time.time() - run_start, 1)
     st.session_state.migration_running = False
-    # For BQ: done only when zero failures; for SF/DBX: always mark done
-    st.session_state.migration_done    = (failed == 0) if bq_run else True
+    st.session_state.migration_done    = failed == 0 and completed == total
 
     st.session_state.migration_summary = {
         "total":        total,
         "completed":    completed,
         "failed":       failed,
+        "pending":      total - completed - failed,
         "total_rows":   total_rows,
         "total_bytes":  total_bytes,
         "total_secs":   wall_secs,
@@ -1044,13 +1054,18 @@ def run_migration(
     }
 
     _log(
-        f"Migration complete · {completed}/{total} succeeded · "
+        f"Migration {'complete' if st.session_state.migration_done else 'incomplete'} · {completed}/{total} succeeded · "
         f"{failed} failed · {_format_bytes(total_bytes)} · {wall_secs}s total",
         "ok" if failed == 0 else "warn",
     )
 
     status_placeholder.empty()
-    progress_placeholder.progress(100, text="Migration complete ✓")
+    if st.session_state.migration_done:
+        progress_placeholder.progress(100, text="Migration complete ✓")
+    else:
+        progress_placeholder.progress(int((completed + failed) / total * 100),
+                                      text=f"Migration incomplete · {failed} failed · {total - completed - failed} pending")
+    return st.session_state.migration_done
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1062,7 +1077,7 @@ def render_execution_controls(
     s3_cfg: dict,
     rs_cfg: dict,
     db_cfg: dict = None,
-    source_type: str = "Snowflake",
+    source_type: str = None,
 ):
     """
     Renders Run / Resume / Reset controls and fires run_migration() on click.
@@ -1075,7 +1090,7 @@ def render_execution_controls(
     is_done  = st.session_state.get("migration_done", False)
 
     _active_src = source_type or st.session_state.get("source_type", "Snowflake")
-    _route = st.session_state.get("pipeline_destination", "")
+    _route = resolve_route(st.session_state.get("pipeline_destination", "Source → S3 → Redshift"), _active_src)
     _bq = is_bigquery(_route)
     is_db = (_active_src == "Databricks")
     if _bq:
@@ -1092,16 +1107,16 @@ def render_execution_controls(
     # How many jobs are already checkpointed as done
     already_done = sum(1 for j in queue if ckpt.get(j["id"]) == "done")
     remaining    = len(queue) - already_done
-    # BQ supports resuming even on first-run failures (idempotent Redshift Data API)
+    # Failed first runs must remain resumable for every source.
     is_resume    = remaining > 0 and (
-        already_done > 0 or (_bq and any(j["status"] == "failed" for j in queue))
+        already_done > 0 or any(j["status"] == "failed" for j in queue)
     )
 
     st.markdown("---")
     st.markdown('<div class="card-title">🚀 Execute Migration</div>', unsafe_allow_html=True)
 
     _dest_mode = st.session_state.get("pipeline_destination", "Source → S3 → Redshift")
-    _s3_only = "S3 only" in _dest_mode
+    _s3_only = s3_only(_route)
 
     col_r1, col_r2, col_r3, col_r4 = st.columns([1, 1, 1, 3])
 
@@ -1159,6 +1174,9 @@ def render_execution_controls(
             job["bytes"]         = 0
             job["duration_secs"] = 0.0
             job["error"]         = ""
+            for _k in ("export_complete", "load_statement_id", "truncate_statement_id",
+                       "target_rows_before", "target_rows_after"):
+                job.pop(_k, None)
             # Clear BigQuery-specific idempotency keys so Redshift Data API retries cleanly
             if job.get("source_type") == "bigquery":
                 import uuid
@@ -1183,10 +1201,12 @@ def render_execution_controls(
     if run_clicked:
         progress_ph = st.progress(0, text="Starting migration…")
         status_ph   = st.empty()
-        run_migration(
+        outcome = run_migration(
             sf_cfg, s3_cfg, rs_cfg, progress_ph, status_ph,
             db_cfg=db_cfg, source_type=_active_src,
         )
+        if outcome is False and not st.session_state.get("migration_summary"):
+            return
 
         # Final outcome banner
         summary = st.session_state.get("migration_summary", {})
@@ -1197,7 +1217,7 @@ def render_execution_controls(
         rows    = summary.get("total_rows", 0)
         size    = _format_bytes(summary.get("total_bytes", 0))
 
-        if failed == 0:
+        if st.session_state.get("migration_done"):
             st.success(
                 f"✅ All {total} tables migrated successfully — "
                 f"**{rows:,} rows** · **{size}** · **{secs}s**"
@@ -1205,7 +1225,7 @@ def render_execution_controls(
         else:
             st.warning(
                 f"⚠ Migration finished with issues — "
-                f"{done} succeeded, {failed} failed. "
+                f"{done} succeeded, {failed} failed, {summary.get('pending', 0)} pending. "
                 f"See below and check the Monitoring tab for details. Click Resume to retry failed tables."
             )
             # Render detailed error cards directly on the active screen for immediate visibility
