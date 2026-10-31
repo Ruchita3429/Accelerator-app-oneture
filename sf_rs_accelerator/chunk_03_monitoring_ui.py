@@ -54,6 +54,7 @@ def _render_summary_bar(queue: list):
     pending = sum(1 for j in queue if j["status"] == "pending")
 
     pct = int((done / total) * 100) if total else 0
+    exported = sum(j.get("export_complete", False) and j["status"] == "pending" for j in queue)
 
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
@@ -88,7 +89,10 @@ def _render_summary_bar(queue: list):
         </div>""", unsafe_allow_html=True)
 
     st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
-    st.progress(pct, text=f"Overall progress — {done}/{total} tables complete ({pct}%)")
+    text = f"Overall progress — {done}/{total} tables complete ({pct}%)"
+    if exported:
+        text += f" · {exported} exported to S3; awaiting Redshift"
+    st.progress(pct, text=text)
 
 
 # ── Filter bar ────────────────────────────────────────────────────────────────
@@ -129,7 +133,7 @@ def _render_status_grid(queue: list, status_filter: str, search: str):
     rows = []
     for j in filtered:
         rows.append({
-            "Status":       _status_icon(j["status"]),
+            "Status":       "📦 S3 exported; awaiting Redshift" if j["status"] == "pending" and j.get("export_complete") else _status_icon(j["status"]),
             "Source (SF)":  f"{j['sf_schema']}.{j['sf_table']}",
             "Target (RS)":  f"{j['rs_schema']}.{j['rs_table']}",
             "Format":       j["file_format"],

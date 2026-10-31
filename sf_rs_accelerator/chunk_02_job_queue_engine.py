@@ -103,6 +103,56 @@ def _is_checkpointed(job_id: str) -> bool:
     return st.session_state.checkpoint.get(job_id) == "done"
 
 
+def record_manual_transfer(stage, *, source_schema=None, source_table=None,
+                           s3_key=None, error="", **metrics):
+    """Keep the existing queue/monitor in sync with the two manual transfer tabs."""
+    queue = st.session_state.get("job_queue", [])
+    source = st.session_state.get("source_type", "Snowflake")
+    route = resolve_route(st.session_state.get("pipeline_destination", "Source → S3 → Redshift"), source)
+    matched = False
+    for job in queue:
+        if stage == "export":
+            matches = (job.get("source_type", source).lower() == source.lower()
+                       and str(job.get("source_schema", job.get("sf_schema", ""))).casefold() == str(source_schema).casefold()
+                       and str(job.get("source_table", job.get("sf_table", ""))).casefold() == str(source_table).casefold())
+        else:
+            matches = (job.get("s3_key") == s3_key
+                       and (not job.get("s3_bucket") or job["s3_bucket"] == metrics.get("s3_bucket")))
+        if not matches:
+            continue
+        matched = True
+        _init_checkpoint()
+        if error:
+            job.update(status="failed", phase=f"{stage} failed", error=error)
+            if stage == "export":
+                job.pop("export_complete", None)
+            _mark_checkpoint(job["id"], "failed")
+        else:
+            if stage == "export":
+                # A new export invalidates any previous load/checkpoint state.
+                for key in ("load_statement_id", "truncate_statement_id", "target_rows_before", "target_rows_after"):
+                    job.pop(key, None)
+                job.update(export_complete=True)
+            complete = stage == "load" or s3_only(route)
+            if stage == "load":
+                job["duration_secs"] = round(job.get("duration_secs", 0) + metrics.get("rs_duration_secs", 0), 2)
+            job.update(metrics, s3_key=s3_key, status="done" if complete else "pending",
+                       phase="done" if complete else "exported to S3; awaiting Redshift", error="")
+            _mark_checkpoint(job["id"], "done" if complete else "pending")
+    if matched:
+        done = [j for j in queue if j.get("status") == "done"]
+        failed = sum(j.get("status") == "failed" for j in queue)
+        seconds = sum(j.get("duration_secs", 0) for j in queue)
+        size = sum(j.get("bytes", 0) for j in done)
+        st.session_state.migration_done = len(done) == len(queue)
+        st.session_state.migration_summary = dict(
+            total=len(queue), completed=len(done), failed=failed,
+            pending=len(queue) - len(done) - failed,
+            total_rows=sum(j.get("rows", 0) for j in done), total_bytes=size,
+            total_secs=seconds, throughput=int(size / seconds) if seconds else 0,
+            finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # REAL CONNECTOR HOOKS — replace these for production
 # ─────────────────────────────────────────────────────────────────────────────

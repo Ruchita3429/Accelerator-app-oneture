@@ -54,7 +54,7 @@ import chunk_02_job_queue_engine
 importlib.reload(chunk_01_table_discovery)
 importlib.reload(chunk_02_job_queue_engine)
 from chunk_01_table_discovery import render_table_discovery, get_job_queue_summary
-from chunk_02_job_queue_engine import render_execution_controls, run_migration
+from chunk_02_job_queue_engine import render_execution_controls, run_migration, record_manual_transfer
 from chunk_03_monitoring_ui   import render_monitoring_tab
 from chunk_04_metrics_report  import render_metrics_tab
 try:
@@ -1480,6 +1480,7 @@ with tab1, tab_loading():
                 all_ok = True
 
                 for i, tbl in enumerate(sf_tables_selected):
+                    _export_started = time.monotonic()
                     progress.progress((i) / len(sf_tables_selected), text=f"Exporting {tbl}…")
                     try:
                         import boto3, io
@@ -1571,11 +1572,10 @@ with tab1, tab_loading():
                                 f"✓ {tbl} → s3://{_s3_cfg['bucket']}/{s3_key} "
                                 f"({_result['rows']:,} rows · Apache Iceberg format)", "ok"
                             )
-                            # sync s3_key back into job_queue
-                            for _job in st.session_state.get("job_queue", []):
-                                if _job.get("sf_table", "").upper() == tbl.upper():
-                                    _job["s3_key"] = s3_key
-                                    break
+                            record_manual_transfer("export", source_schema=sf_schema, source_table=tbl,
+                                                   s3_key=s3_key, rows=_result["rows"], bytes=_result["bytes"],
+                                                   file_format=file_format, s3_bucket=_s3_cfg["bucket"],
+                                                   duration_secs=round(time.monotonic() - _export_started, 2))
                             continue  # skip the put_object path below
                         elif file_format == "Parquet":
                             import pyarrow as pa
@@ -1617,15 +1617,16 @@ with tab1, tab_loading():
                         s3_key = f"{_s3_cfg['prefix'].rstrip('/')}/{sf_schema}/{fname}"
                         s3_client.put_object(Bucket=_s3_cfg["bucket"], Key=s3_key, Body=body)
 
-                        # Sync s3_key back into job_queue so COPY uses the exact uploaded path
-                        for _job in st.session_state.get("job_queue", []):
-                            if _job.get("sf_table", "").upper() == tbl.upper():
-                                _job["s3_key"] = s3_key
-                                break
+                        record_manual_transfer("export", source_schema=sf_schema, source_table=tbl,
+                                               s3_key=s3_key, rows=len(rows), bytes=len(body), file_format=file_format,
+                                               s3_bucket=_s3_cfg["bucket"], delimiter=",", include_header=True,
+                                               compression=compress and file_format in ("Parquet", "JSON"),
+                                               duration_secs=round(time.monotonic() - _export_started, 2))
 
                         add_log(f"✓ {tbl} → s3://{_s3_cfg['bucket']}/{s3_key} ({len(rows):,} rows)", "ok")
 
                     except Exception as exc:
+                        record_manual_transfer("export", source_schema=sf_schema, source_table=tbl, error=str(exc))
                         add_log(f"✗ {tbl}: {exc}", "err")
                         st.error(f"Export failed for {tbl}: {exc}")
                         all_ok = False
@@ -2059,6 +2060,7 @@ with tab2, tab_loading():
 
                     # ── COPY ──────────────────────────────────────────────────────
                     try:
+                        _load_started = time.monotonic()
                         _do_redshift_copy(
                             _rscfg_load, _s3cfg_load, s3_key,
                             t2_rs_schema, t2_rs_table, file_fmt, t2_load_mode,
@@ -2071,9 +2073,14 @@ with tab2, tab_loading():
                             rs_compupdate=t2_compupdate,
                             rs_statupdate=t2_statupdate,
                         )
+                        record_manual_transfer("load", s3_key=s3_key,
+                                               rs_schema=t2_rs_schema, rs_table=t2_rs_table,
+                                               s3_bucket=_s3cfg_load["bucket"],
+                                               rs_duration_secs=round(time.monotonic() - _load_started, 2))
                         succeeded.append(fname)
                         add_log(f"✓ {fname} → {t2_rs_schema}.{t2_rs_table}", "ok")
                     except Exception as copy_err:
+                        record_manual_transfer("load", s3_key=s3_key, s3_bucket=_s3cfg_load["bucket"], error=str(copy_err))
                         failed.append((fname, str(copy_err)))
                         add_log(f"✗ COPY failed {fname}: {copy_err}", "err")
                         break
