@@ -826,13 +826,7 @@ def _render_connection_guard(rs_cfg, src_cfg, source_type="Snowflake"):
                 missing.append('Snowflake (account, user, database)')
         if not rs_ok:
             missing.append('Redshift (workgroup, database, region)')
-        st.markdown(
-            f'<div style="background:var(--red)15;border:1px solid var(--red)44;border-radius:10px;padding:16px 20px;margin-top:8px">'
-            f'<div style="color:var(--red);font-size:14px;font-weight:600;margin-bottom:6px">⚠ Connections not configured</div>'
-            f'<div style="color:var(--muted);font-size:13px">Connect the following in the sidebar first: {" and ".join(missing)}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+        st.warning(f'**Connections not configured** — Connect the following in the sidebar first: {" and ".join(missing)}')
         return False
     return True
 
@@ -932,14 +926,7 @@ def _render_table_selectors(rs_cfg, src_cfg, source_type="Snowflake"):
                     src_table = None
 
     if rs_table and src_table and rs_table.lower() != src_table.lower():
-        st.markdown(
-            f'<div style="background:#fbbf2415;border:1px solid #fbbf2455;border-radius:8px;padding:10px 14px;margin-top:8px">'
-            f'<span style="color:var(--amber)">⚠ Table name mismatch — </span>'
-            f'<span style="color:var(--muted);font-size:13px">Redshift: <code style="color:var(--amber)">{rs_table}</code> '
-            f'vs {src_name}: <code style="color:{src_color}">{src_table}</code>. Proceeding will compare these two tables.</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+        st.warning(f'**Table name mismatch** — Redshift: `{rs_table}` vs {src_name}: `{src_table}`. Proceeding will compare these two tables.')
 
     st.session_state.val2_rs_schema = rs_schema or ''
     st.session_state.val2_rs_table = rs_table or ''
@@ -1183,12 +1170,7 @@ def render_validation_tab(rs_cfg=None, sf_cfg=None, db_cfg=None, source_type=Non
     with metrics_col:
         _section('Step 2 — Data Metrics & Hash Proximity')
         if st.session_state.get('val2_stage') == 'schema_fail':
-            st.markdown(
-                '<div style="background:var(--red)15;border:1px solid var(--red)44;border-radius:8px;padding:10px 14px">'
-                '<span style="color:var(--red)">🔒 Schema mismatch detected — fix schema differences before running metrics validation to avoid misleading results.</span>'
-                '</div>',
-                unsafe_allow_html=True,
-            )
+            st.error('**Schema mismatch detected** — Fix schema differences before running metrics validation to avoid misleading results.')
         run_metrics = st.button(
             '▶ Run Metrics & Hash Check',
             key='btn_val2_metrics',

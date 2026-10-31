@@ -1102,49 +1102,9 @@ with tab_discovery, tab_loading():
     # ── Destination mode reminder ─────────────────────────────────────────────
 
     if _s3_only:
-        st.markdown(
-            """
-            <div style="
-                background: var(--secondary-background-color);
-                border: 1px solid #D97706;
-                border-left: 4px solid #D97706;
-                border-radius: 8px;
-                padding: 12px 16px;
-                color: var(--text-color);
-                font-size: 14px;
-                line-height: 1.6;
-                margin-bottom: 12px;
-            ">
-                <strong style="color: #D97706;">S3-only mode</strong>
-                <span> — The queue will export to S3 and stop there.
-                The Redshift COPY step will be skipped.
-                Change the <strong>Pipeline Destination</strong>
-                dropdown above to enable the full pipeline.</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.warning("**S3-only mode** — The queue will export to S3 and stop there. The Redshift COPY step will be skipped. Change **Pipeline Destination** above to enable the full pipeline.")
     else:
-        st.markdown(
-            """
-            <div style="
-                background: var(--secondary-background-color);
-                border: 1px solid #16A34A;
-                border-left: 4px solid #16A34A;
-                border-radius: 8px;
-                padding: 12px 16px;
-                color: var(--text-color);
-                font-size: 14px;
-                line-height: 1.6;
-                margin-bottom: 12px;
-            ">
-                <strong style="color: #16A34A;">Full pipeline mode</strong>
-                <span> — The queue will run
-                Snowflake → S3 → Redshift COPY.</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.info(f"**Full pipeline mode** — The queue will run {_source_type} → S3 → Redshift COPY.")
 
     # ── Partition / Filter configuration ─────────────────────────────────────
     st.markdown("---")
@@ -1181,13 +1141,7 @@ with tab_discovery, tab_loading():
         st.session_state["global_use_filters"] = _g_filters
 
     if _g_partitions or _g_filters:
-        st.markdown(
-            '<div style="background:#13161f;border:1px solid #2a3148;border-radius:8px;'
-            'padding:8px 14px;color:#6b7080;font-size:12px;margin-bottom:8px">'
-            'ℹ Tables not found in the metadata table will be exported without partitioning or '
-            'filtering — no errors will be raised for missing rows.</div>',
-            unsafe_allow_html=True,
-        )
+        st.info("Tables not found in the metadata table will be exported without partitioning or filtering — no errors will be raised for missing rows.")
 
         # Load / refresh metadata from Snowflake
         _meta_load_col, _ = st.columns([2, 5])
@@ -1293,49 +1247,9 @@ with tab1, tab_loading():
         # ── Destination mode banner ───────────────────────────────────────────────
 
         if _s3_only:
-            st.markdown(
-                """
-                <div style="
-                    background: var(--secondary-background-color);
-                    border: 1px solid #D97706;
-                    border-left: 4px solid #D97706;
-                    border-radius: 8px;
-                    padding: 12px 16px;
-                    color: var(--text-color);
-                    font-size: 14px;
-                    line-height: 1.6;
-                    margin-bottom: 12px;
-                ">
-                    <strong style="color: #D97706;">S3-only mode</strong>
-                    <span> — The queue will export to S3 and stop there.
-                    The Redshift COPY step will be skipped.
-                    Change the <strong>Pipeline Destination</strong>
-                    dropdown above to enable the full pipeline.</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            st.warning("**S3-only mode** — The queue will export to S3 and stop there. The Redshift COPY step will be skipped. Change **Pipeline Destination** above to enable the full pipeline.")
         else:
-            st.markdown(
-                """
-                <div style="
-                    background: var(--secondary-background-color);
-                    border: 1px solid #16A34A;
-                    border-left: 4px solid #16A34A;
-                    border-radius: 8px;
-                    padding: 12px 16px;
-                    color: var(--text-color);
-                    font-size: 14px;
-                    line-height: 1.6;
-                    margin-bottom: 12px;
-                ">
-                    <strong style="color: #16A34A;">Full pipeline mode</strong>
-                    <span> — The queue will run
-                    Snowflake → S3 → Redshift COPY.</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            st.info(f"**Full pipeline mode** — The queue will run {_source_type} → S3 → Redshift COPY.")
 
         col_left, col_right = st.columns([1, 1], gap="large")
 
@@ -1434,19 +1348,7 @@ with tab1, tab_loading():
 
             # ── Iceberg info banner ───────────────────────────────────────────────
             if file_format == "Iceberg":
-                st.markdown(
-                    '<div style="background:#162040;border:1px solid #2a4080;border-radius:10px;'
-                    'padding:12px 16px;margin-top:8px">'
-                    '<div style="color:#7aa8f5;font-size:13px;font-weight:600;margin-bottom:4px">'
-                    f'{_brand_icon("iceberg")} Iceberg Format Selected</div>'
-                    '<div style="color:#8891a8;font-size:12px;line-height:1.7">'
-                    'Data will be written to S3 as an Apache Iceberg table using <code>pyiceberg</code> and AWS Glue.<br>'
-                    'Layout: <code>s3://bucket/prefix/SCHEMA/TABLE/metadata/</code> + <code>data/</code><br>'
-                    '⚠ AWS credentials require Glue database/table permissions in addition to S3 access.<br>'
-                    '⚠ Use the Job Queue engine (Advanced expander below) for Iceberg exports.'
-                    '</div></div>',
-                    unsafe_allow_html=True,
-                )
+                st.info("**Iceberg format selected** — Data is written under `s3://bucket/prefix/SCHEMA/TABLE/metadata/` and `data/`. AWS credentials need Glue database/table permissions as well as S3 access.")
 
             if len(sf_tables_selected) <= 1:
                 s3_filename = st.text_input(
@@ -1645,14 +1547,7 @@ with tab1, tab_loading():
         )
         with st.expander(_jq_label, expanded=False):
             if _s3_only:
-                st.markdown(
-                    '<div style="background:#2a2010;border:1px solid #78350f;border-radius:8px;'
-                    'padding:8px 14px;color:#fbbf24;font-size:12px;margin-bottom:10px">'
-                    '◌ <b>S3-only mode</b> — the queue runner will execute the source → S3 export '
-                    'for each job and <b>skip the Redshift COPY step</b>. '
-                    'Switch the Pipeline Destination to "Source → S3 → Redshift" to enable COPY.</div>',
-                    unsafe_allow_html=True,
-                )
+                st.warning("**S3-only mode** — The queue exports each job to S3 and skips Redshift COPY. Change **Pipeline Destination** above to enable the full pipeline.")
             render_execution_controls(
                 sf_cfg=_sf_cfg,
                 s3_cfg=_s3_cfg,
@@ -1782,14 +1677,7 @@ with tab2, tab_loading():
 
     # ── Destination mode banner ───────────────────────────────────────────────
     if _s3_only:
-        st.markdown(
-            '<div style="background:#2e1010;border:1px solid #7f1d1d;border-radius:10px;'
-            'padding:14px 18px;color:#f87171;font-size:14px;font-weight:600;margin-bottom:16px">'
-            '✗ Redshift COPY is disabled in <b>S3-only mode</b>. '
-            'Use the <b>Pipeline Destination</b> dropdown above and switch to '
-            '"Source → S3 → Redshift" to enable this tab.</div>',
-            unsafe_allow_html=True,
-        )
+        st.warning("**S3-only mode** — The queue exports each job to S3 and skips Redshift COPY. Change **Pipeline Destination** above to enable the full pipeline.")
         _tab2_skip = True
     else:
         _tab2_skip = False
@@ -2412,23 +2300,19 @@ def _render_validate_result(result: dict) -> str:
         return ""
     html = ""
     if result["ok"] and not result["errors"]:
-        icon, bg, border, fg = "✓", "#0f2e1e", "#1a5c3a", "#34d399"
+        icon, kind = "✓", "success"
         msg = "Syntax valid — Redshift dialect"
     else:
-        icon, bg, border, fg = "✗", "#2e1010", "#7f1d1d", "#f87171"
+        icon, kind = "✗", "error"
         msg = "Syntax errors detected"
-    html += (f'<div style="background:{bg};border:1px solid {border};border-radius:10px;'
-             f'padding:10px 16px;color:{fg};font-size:13px;font-weight:600;margin-bottom:6px">'
+    html += (f'<div class="app-notice app-notice-{kind}">'
              f'{icon} {msg}</div>')
     for err in result["errors"]:
-        html += (f'<div style="background:#2e1010;border:1px solid #7f1d1d;border-radius:8px;'
-                 f'padding:7px 12px;color:#f87171;font-size:12px;margin-bottom:4px">✗ {_esc(err)}</div>')
+        html += f'<div class="app-notice app-notice-error">✗ {_esc(err)}</div>'
     for warn in result["warnings"]:
-        html += (f'<div style="background:#2a2010;border:1px solid #78350f;border-radius:8px;'
-                 f'padding:7px 12px;color:#fbbf24;font-size:12px;margin-bottom:4px">{_esc(warn)}</div>')
+        html += f'<div class="app-notice app-notice-warning">{_esc(warn)}</div>'
     for note in result.get("dialect_notes", []):
-        html += (f'<div style="background:#13161f;border:1px solid #2a3148;border-radius:8px;'
-                 f'padding:7px 12px;color:#6b7080;font-size:12px;margin-bottom:4px">{_esc(note)}</div>')
+        html += f'<div class="app-notice app-notice-info">{_esc(note)}</div>'
     return html
 
 

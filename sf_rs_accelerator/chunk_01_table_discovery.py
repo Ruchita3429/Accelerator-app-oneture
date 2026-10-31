@@ -267,6 +267,11 @@ def _build_job_queue(
     return queue
 
 
+def _sync_table_selection(schema):
+    """Keep the queue selection in step with a schema's dropdown widget."""
+    st.session_state.table_selections[schema] = list(st.session_state.get(f"multisel_{schema}", []))
+
+
 # ── Main render function ──────────────────────────────────────────────────────
 def render_table_discovery(
     sf_cfg: dict = None,
@@ -387,9 +392,12 @@ def render_table_discovery(
         if st.button("✅ Select All", key="btn_select_all"):
             for schema, tables in all_tables.items():
                 st.session_state.table_selections[schema] = list(tables)
+                st.session_state[f"multisel_{schema}"] = list(tables)
     with col_deselall:
         if st.button("⬜ Deselect All", key="btn_deselect_all"):
             st.session_state.table_selections = {}
+            for schema in all_tables:
+                st.session_state[f"multisel_{schema}"] = []
 
     total_selected = sum(len(v) for v in st.session_state.table_selections.values())
     with col_count:
@@ -418,22 +426,15 @@ def render_table_discovery(
         label = f"**{schema}** &nbsp; `{selected_count}/{total_count} selected`"
 
         with st.expander(label, expanded=(selected_count > 0)):
-            col_sa, col_sda, _ = st.columns([1, 1, 5])
-            with col_sa:
-                if st.button(f"All", key=f"selall_{schema}"):
-                    st.session_state.table_selections[schema] = list(tables)
-                    st.rerun()
-            with col_sda:
-                if st.button(f"None", key=f"deselall_{schema}"):
-                    st.session_state.table_selections[schema] = []
-                    st.rerun()
-
             # Multi-select for this schema
+            widget_key = f"multisel_{schema}"
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = list(current_selection)
             selected = st.multiselect(
                 f"Tables in {schema}",
                 options=tables,
-                default=st.session_state.table_selections.get(schema, []),
-                key=f"multisel_{schema}",
+                key=widget_key,
+                on_change=_sync_table_selection, args=(schema,),
                 label_visibility="collapsed",
             )
             st.session_state.table_selections[schema] = selected
