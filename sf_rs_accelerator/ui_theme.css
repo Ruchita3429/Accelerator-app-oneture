@@ -189,7 +189,7 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible,
 [data-testid="stFileUploaderDropzone"] { background: var(--surface); border: 1px dashed var(--border); border-radius: 8px; color: var(--text); }
 [data-testid="stFileUploaderDropzone"] small { color: var(--muted); }
 [data-testid="stExpander"] details { border: 1px solid var(--border); background: var(--surface); border-radius: 8px; }
-[data-testid="stExpander"] summary { color: var(--text); padding-block: 12px; }
+[data-testid="stExpander"] summary { color: var(--text); background: var(--surface); padding-block: 12px; }
 [data-testid="stExpander"] summary:hover { color: var(--accent); }
 [data-testid="stAlert"] { border-radius: 8px; }
 [data-testid="stAlertContainer"], .app-notice { background: var(--accent-soft); color: var(--accent); border: 1px solid currentColor; border-left-width: 4px; border-radius: 8px; padding: 12px 16px; font-size: 14px; line-height: 1.6; }

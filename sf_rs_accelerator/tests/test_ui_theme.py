@@ -88,6 +88,7 @@ class ThemeTests(unittest.TestCase):
             self.assertIn('stTextInputRootElement', css)
             self.assertIn('stSelectboxVirtualDropdown', css)
             self.assertIn('stMultiSelectDropdown', css)
+            self.assertIn('[data-testid="stExpander"] summary { color: var(--text); background: var(--surface);', css)
             self.assertIn(".brand-icon-redshift", css)
             self.assertIn('flex-wrap: wrap', css)
             self.assertIn('prefers-reduced-motion', css)
