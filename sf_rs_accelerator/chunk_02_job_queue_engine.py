@@ -57,6 +57,7 @@ import time
 from datetime import datetime
 
 from pipeline_routes import is_bigquery, s3_only, source_name, formats_for, resolve_route
+from aws_credentials import boto3_credentials
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -226,6 +227,7 @@ def _extract_snowflake_to_s3_iceberg(job: dict, sf_cfg: dict, s3_cfg: dict) -> d
         log_fn=_log,
     )
     job["s3_key"] = res["s3_key"]
+    job["iceberg_data_key"] = res.get("data_key")
     return res
 
 
@@ -319,6 +321,7 @@ def _extract_databricks_to_s3_iceberg(job: dict, db_cfg: dict, s3_cfg: dict) -> 
         log_fn=_log,
     )
     job["s3_key"] = res["s3_key"]
+    job["iceberg_data_key"] = res.get("data_key")
     return res
 
 
@@ -407,9 +410,8 @@ def _extract_databricks_to_s3(job: dict, db_cfg: dict, s3_cfg: dict) -> dict:
 
     s3_client = boto3.client(
         "s3",
-        aws_access_key_id=s3_cfg["access_key"],
-        aws_secret_access_key=s3_cfg["secret_key"],
         region_name=s3_cfg["region"],
+        **boto3_credentials(s3_cfg),
     )
     s3_client.put_object(
         Bucket=s3_cfg["bucket"],
@@ -467,7 +469,9 @@ def _extract_snowflake_to_s3(job: dict, sf_cfg: dict, s3_cfg: dict) -> dict:
     _creds = (
         f"CREDENTIALS=("
         f"AWS_KEY_ID='{s3_cfg['access_key']}' "
-        f"AWS_SECRET_KEY='{s3_cfg['secret_key']}')"
+        f"AWS_SECRET_KEY='{s3_cfg['secret_key']}'"
+        + (f" AWS_TOKEN='{s3_cfg['session_token']}'" if s3_cfg.get("session_token") else "")
+        + ")"
     )
     _header_opt = "HEADER=TRUE" if _fmt == "CSV" else ""
 
@@ -651,8 +655,11 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
     client = boto3.client(
         "redshift-data",
         region_name=rs_cfg.get("region") or s3_cfg.get("region") or "ap-south-1",
-        aws_access_key_id=rs_cfg.get("access_key") or s3_cfg.get("access_key"),
-        aws_secret_access_key=rs_cfg.get("secret_key") or s3_cfg.get("secret_key"),
+        **boto3_credentials({
+            "access_key": rs_cfg.get("access_key") or s3_cfg.get("access_key"),
+            "secret_key": rs_cfg.get("secret_key") or s3_cfg.get("secret_key"),
+            "session_token": rs_cfg.get("session_token") or s3_cfg.get("session_token"),
+        }),
     )
 
     def _execute_sync(sql: str, timeout: int = 120, statement_key=None):
@@ -807,11 +814,17 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
     s3_key = job["s3_key"]
     ak = s3_cfg["access_key"]
     sk = s3_cfg["secret_key"]
+    sts_clause = f"SESSION_TOKEN '{s3_cfg['session_token']}'" if s3_cfg.get("session_token") else ""
     s3_region = s3_cfg.get("region") or rs_cfg.get("region") or "ap-south-1"
 
     if fmt == "ICEBERG":
-        # Redshift COPY ingests the parquet data files under /data/
-        s3_path = f"s3://{s3_bucket}/{s3_key.rstrip('/')}/data/"
+        # Load only the data file written by this run. Each run writes a new
+        # <uuid>-00000.parquet and older files stay in /data/, so a prefix COPY
+        # would also load rows from earlier attempts and duplicate them.
+        if job.get("iceberg_data_key"):
+            s3_path = f"s3://{s3_bucket}/{job['iceberg_data_key']}"
+        else:
+            s3_path = f"s3://{s3_bucket}/{s3_key.rstrip('/')}/data/"
         format_clause = "FORMAT AS PARQUET"
     elif fmt == "PARQUET":
         s3_path = f"s3://{s3_bucket}/{s3_key}"
@@ -840,15 +853,21 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
         s3_path = f"s3://{s3_bucket}/{s3_key}"
         format_clause = f"FORMAT AS {fmt}"
 
+    # Redshift rejects COMPUPDATE for columnar (PARQUET/ORC) COPY; Iceberg loads
+    # use FORMAT AS PARQUET, so they are excluded too.
+    columnar = fmt in ("PARQUET", "ICEBERG", "ORC")
+    tuning_clause = "STATUPDATE ON" if columnar else "COMPUPDATE ON STATUPDATE ON"
+
     copy_command = f"""
         COPY "{rs_schema}"."{rs_table}"
         FROM '{s3_path}'
         ACCESS_KEY_ID '{ak}'
         SECRET_ACCESS_KEY '{sk}'
+        {sts_clause}
         REGION '{s3_region}'
         {format_clause}
         MAXERROR 0
-        COMPUPDATE ON STATUPDATE ON;
+        {tuning_clause};
     """
 
     _log(f"COPY path: {s3_path}")

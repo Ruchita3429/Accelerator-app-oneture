@@ -20,6 +20,7 @@ import io
 import json
 import time
 import uuid
+from aws_credentials import boto3_credentials
 import boto3
 import pyarrow_compat
 import pandas as pd
@@ -187,9 +188,8 @@ def write_iceberg_table_to_s3(
     # 5. Upload files to S3 via boto3
     s3_client = boto3.client(
         "s3",
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
         region_name=region,
+        **boto3_credentials(s3_cfg),
     )
 
     # 5a. Upload Parquet data file
@@ -223,9 +223,8 @@ def write_iceberg_table_to_s3(
     try:
         glue_client = boto3.client(
             "glue",
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
             region_name=region,
+            **boto3_credentials(s3_cfg),
         )
         # Ensure Glue database exists
         try:

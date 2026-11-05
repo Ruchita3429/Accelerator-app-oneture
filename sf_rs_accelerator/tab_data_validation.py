@@ -10,6 +10,7 @@ Supports both Databricks (DBX) <-> Redshift and Snowflake (SF) <-> Redshift vali
 """
 
 from ui_brands import brand_icon
+from aws_credentials import boto3_credentials
 
 import time
 import streamlit as st
@@ -121,8 +122,7 @@ def _rs_run_sql(cfg, sql, timeout=120):
     client = boto3.client(
         'redshift-data',
         region_name=cfg.get('region'),
-        aws_access_key_id=cfg.get('access_key'),
-        aws_secret_access_key=cfg.get('secret_key'),
+        **boto3_credentials(cfg),
     )
     resp = client.execute_statement(
         WorkgroupName=cfg.get('workgroup'),

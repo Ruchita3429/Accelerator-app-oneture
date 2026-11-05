@@ -46,6 +46,7 @@ import io
 import json
 from datetime import datetime
 from pipeline_routes import resolve_route, s3_only, reset_queue
+from aws_credentials import boto3_credentials, redshift_copy_credentials
 
 # ── Chunk module imports ──────────────────────────────────────────────────────
 import importlib
@@ -548,8 +549,7 @@ def _rs_data_api_client(cfg):
     return boto3.client(
         "redshift-data",
         region_name=cfg.get("region", "ap-south-1"),
-        aws_access_key_id=cfg.get("access_key"),
-        aws_secret_access_key=cfg.get("secret_key"),
+        **boto3_credentials(cfg),
     )
 
 def _rs_run_sql(cfg, sql, timeout=60):
@@ -921,6 +921,10 @@ with st.sidebar:
     s3_prefix      = st.text_input("Prefix / Path",   placeholder="pipeline/exports", key="s3_prefix")
     s3_access_key  = st.text_input("Access Key ID",   placeholder="AKIA…",           key="s3_access_key")
     s3_secret_key  = st.text_input("Secret Access Key", type="password",             key="s3_secret_key")
+    s3_session_token = st.text_input(
+        "Session Token (temporary credentials only)", type="password", key="s3_session_token",
+        help="Required with temporary AWS credentials, whose Access Key ID normally starts with ASIA.",
+    )
     s3_region      = st.text_input("Region",          placeholder="us-east-1",       key="s3_region", value="us-east-1")
 
     st.markdown("---")
@@ -937,7 +941,7 @@ with st.sidebar:
 
     if st.button("Connect Redshift", key="btn_rs_connect"):
         with st.spinner("Connecting…"):
-            cfg = {"workgroup": rs_workgroup, "database": rs_db, "region": rs_region, "access_key": s3_access_key, "secret_key": s3_secret_key}
+            cfg = {"workgroup": rs_workgroup, "database": rs_db, "region": rs_region, "access_key": s3_access_key, "secret_key": s3_secret_key, "session_token": s3_session_token}
             try:
                 # Strip full endpoint URL if pasted — extract just workgroup name
                 cfg["workgroup"] = cfg["workgroup"].split(".")[0].strip()
@@ -1005,6 +1009,7 @@ _s3_cfg = {
     "prefix":     (s3_prefix or "").strip().strip("/"),
     "access_key": (s3_access_key or "").strip(),
     "secret_key": (s3_secret_key or "").strip(),
+    "session_token": (s3_session_token or "").strip(),
     "region":     (s3_region or "").strip(),
 }
 
@@ -1014,6 +1019,7 @@ _rs_cfg = {
     "region":     (rs_region or "").strip(),
     "access_key": (s3_access_key or "").strip(),
     "secret_key": (s3_secret_key or "").strip(),
+    "session_token": (s3_session_token or "").strip(),
 }
 
 
@@ -1512,9 +1518,8 @@ with tab1, tab_loading():
                         # Upload to S3
                         s3_client = boto3.client(
                             "s3",
-                            aws_access_key_id=_s3_cfg["access_key"],
-                            aws_secret_access_key=_s3_cfg["secret_key"],
                             region_name=_s3_cfg["region"],
+                            **boto3_credentials(_s3_cfg),
                         )
                         s3_key = f"{_s3_cfg['prefix'].rstrip('/')}/{sf_schema}/{fname}"
                         s3_client.put_object(Bucket=_s3_cfg["bucket"], Key=s3_key, Body=body)
@@ -1577,7 +1582,7 @@ def _detect_fmt(key: str) -> str:
             return fmt
     return "Unknown"
 
-def _s3_list_prefix(bucket, prefix, access_key, secret_key, region):
+def _s3_list_prefix(bucket, prefix, access_key, secret_key, region, session_token=""):
     """
     List one level of an S3 prefix — returns:
       folders: list of prefix strings (common prefixes / virtual directories)
@@ -1586,8 +1591,9 @@ def _s3_list_prefix(bucket, prefix, access_key, secret_key, region):
     """
     try:
         import boto3
-        s3 = boto3.client("s3", aws_access_key_id=access_key,
-                          aws_secret_access_key=secret_key, region_name=region)
+        s3 = boto3.client("s3", region_name=region, **boto3_credentials({
+            "access_key": access_key, "secret_key": secret_key, "session_token": session_token,
+        }))
         resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter="/")
         folders = [cp["Prefix"] for cp in resp.get("CommonPrefixes", [])]
         files   = [
@@ -1612,11 +1618,12 @@ def _rs_get_table_columns(rs_cfg, schema, table):
     except Exception:
         return None
 
-def _peek_file_columns(bucket, key, fmt, access_key, secret_key, region):
+def _peek_file_columns(bucket, key, fmt, access_key, secret_key, region, session_token=""):
     try:
         import boto3, io, csv as _csv
-        s3 = boto3.client("s3", aws_access_key_id=access_key,
-                          aws_secret_access_key=secret_key, region_name=region)
+        s3 = boto3.client("s3", region_name=region, **boto3_credentials({
+            "access_key": access_key, "secret_key": secret_key, "session_token": session_token,
+        }))
         if fmt == "Parquet":
             import pandas as pd
             raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
@@ -1644,29 +1651,29 @@ def _do_redshift_copy(rs_cfg, s3_cfg, s3_key, rs_schema, rs_table, fmt, load_mod
                       rs_encoding="UTF8", rs_date_fmt="YYYY-MM-DD",
                       rs_max_error=10, rs_compupdate=True, rs_statupdate=True):
     s3_uri = f"s3://{s3_cfg['bucket']}/{s3_key}"
-    ak, sk  = s3_cfg["access_key"], s3_cfg["secret_key"]
+    credentials = redshift_copy_credentials(s3_cfg)
     if load_mode == "TRUNCATE & LOAD":
         _rs_run_sql(rs_cfg, f'TRUNCATE TABLE "{rs_schema}"."{rs_table}"', timeout=30)
     delim_map = {",  (comma)": ",", "|  (pipe)": "|", "\\t  (tab)": "\t", ";  (semicolon)": ";"}
     delim = delim_map.get(rs_delimiter, rs_delimiter)
     if fmt == "CSV":
         sql = f"""COPY "{rs_schema}"."{rs_table}" FROM '{s3_uri}'
-            ACCESS_KEY_ID '{ak}' SECRET_ACCESS_KEY '{sk}'
+            {credentials}
             FORMAT AS CSV DELIMITER '{delim}' QUOTE '"' IGNOREHEADER {rs_skip_header}
             NULL AS '{rs_null_as}' ENCODING {rs_encoding} DATEFORMAT '{rs_date_fmt}'
             MAXERROR {rs_max_error} {"COMPUPDATE ON" if rs_compupdate else "COMPUPDATE OFF"}
             {"STATUPDATE ON" if rs_statupdate else "STATUPDATE OFF"} TIMEFORMAT 'auto'"""
     elif fmt == "Parquet":
         sql = f"""COPY "{rs_schema}"."{rs_table}" FROM '{s3_uri}'
-            ACCESS_KEY_ID '{ak}' SECRET_ACCESS_KEY '{sk}'
+            {credentials}
             FORMAT AS PARQUET MAXERROR {rs_max_error}"""
     elif fmt == "ORC":
         sql = f"""COPY "{rs_schema}"."{rs_table}" FROM '{s3_uri}'
-            ACCESS_KEY_ID '{ak}' SECRET_ACCESS_KEY '{sk}'
+            {credentials}
             FORMAT AS ORC MAXERROR {rs_max_error}"""
     else:
         sql = f"""COPY "{rs_schema}"."{rs_table}" FROM '{s3_uri}'
-            ACCESS_KEY_ID '{ak}' SECRET_ACCESS_KEY '{sk}'
+            {credentials}
             FORMAT AS JSON 'auto' MAXERROR {rs_max_error}
             {"COMPUPDATE ON" if rs_compupdate else "COMPUPDATE OFF"}"""
     _rs_run_sql(rs_cfg, sql.strip(), timeout=300)
@@ -1707,7 +1714,7 @@ with tab2, tab_loading():
                     current_prefix = st.session_state.get("t2_browser_prefix", "")
                     with st.spinner(f"Listing s3://{bucket_to_use}/{current_prefix} …"):
                         res = _s3_list_prefix(bucket_to_use, current_prefix,
-                                              s3_access_key, s3_secret_key, s3_region)
+                                              s3_access_key, s3_secret_key, s3_region, s3_session_token)
                     if isinstance(res, Exception):
                         st.error(f"Cannot access bucket: {res}")
                     else:
@@ -1750,7 +1757,7 @@ with tab2, tab_loading():
                         with st.spinner(f"Opening {chosen_folder}/ …"):
                             res2 = _s3_list_prefix(
                                 st.session_state["t2_bucket_val"], selected_full,
-                                s3_access_key, s3_secret_key, s3_region,
+                                s3_access_key, s3_secret_key, s3_region, s3_session_token,
                             )
                         if isinstance(res2, Exception):
                             st.error(str(res2))
@@ -1828,6 +1835,7 @@ with tab2, tab_loading():
                 "region":    rs_region,
                 "access_key": s3_access_key,
                 "secret_key": s3_secret_key,
+                "session_token": s3_session_token,
             }
 
             # ── Schema selector ───────────────────────────────────────────────────
@@ -1912,6 +1920,7 @@ with tab2, tab_loading():
                     "bucket":     st.session_state.get("t2_bucket_val", t2_bucket),
                     "access_key": s3_access_key,
                     "secret_key": s3_secret_key,
+                    "session_token": s3_session_token,
                     "region":     s3_region,
                 }
 
@@ -1930,7 +1939,7 @@ with tab2, tab_loading():
                     if rs_cols_lower is not None:
                         file_cols = _peek_file_columns(
                             _s3cfg_load["bucket"], s3_key, file_fmt,
-                            s3_access_key, s3_secret_key, s3_region,
+                            s3_access_key, s3_secret_key, s3_region, s3_session_token,
                         )
                         if file_cols:
                             fcl = {c.lower() for c in file_cols}

@@ -8,6 +8,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from pipeline_routes import BQ_REDSHIFT, formats_for, source_name
+from aws_credentials import boto3_credentials
 
 
 def iceberg_schema(arrow_schema):
@@ -47,6 +48,7 @@ def write_iceberg(table, job, s3_cfg):
         "client.region": s3_cfg['region'],
         "client.access-key-id": s3_cfg['access_key'],
         "client.secret-access-key": s3_cfg['secret_key'],
+        **({"client.session-token": s3_cfg["session_token"]} if s3_cfg.get("session_token") else {}),
     })
     # Ownership prevents this route overwriting a same-named Snowflake/other-project table.
     owner = "bigquery:" + source_name(job)
@@ -60,8 +62,7 @@ def write_iceberg(table, job, s3_cfg):
     else:
         # Also check for a pre-existing, unregistered location before claiming it.
         import boto3
-        s3 = boto3.client('s3', region_name=s3_cfg['region'],
-                          aws_access_key_id=s3_cfg['access_key'], aws_secret_access_key=s3_cfg['secret_key'])
+        s3 = boto3.client('s3', region_name=s3_cfg['region'], **boto3_credentials(s3_cfg))
         key = '/'.join(p for p in (prefix, namespace, name) if p) + '/'
         if s3.list_objects_v2(Bucket=s3_cfg['bucket'], Prefix=key, MaxKeys=1).get('KeyCount', 0):
             raise ValueError("Iceberg destination already contains objects without a matching Glue registration.")
@@ -144,8 +145,7 @@ def extract_to_s3(job, client, s3_cfg):
         body = serialize_table(table, job['file_format'], job.get('compression', False))
         if job['file_format'] == 'JSON' and job.get('compression') and not job['s3_key'].endswith('.gz'):
             job['s3_key'] += '.gz'
-        s3 = boto3.client('s3', region_name=s3_cfg['region'],
-                          aws_access_key_id=s3_cfg['access_key'], aws_secret_access_key=s3_cfg['secret_key'])
+        s3 = boto3.client('s3', region_name=s3_cfg['region'], **boto3_credentials(s3_cfg))
         s3.put_object(Bucket=s3_cfg['bucket'], Key=job['s3_key'], Body=body)
         size = len(body)
     job['export_complete'] = True
@@ -194,6 +194,8 @@ def build_copy_sql(job, s3_cfg):
         raise ValueError("Redshift COPY supports Parquet, ORC or JSON on the BigQuery route.")
     target = quote_identifier(job['rs_schema']) + '.' + quote_identifier(job['rs_table'])
     credentials = f"aws_access_key_id={s3_cfg['access_key']};aws_secret_access_key={s3_cfg['secret_key']}"
+    if s3_cfg.get('session_token'):
+        credentials += f";token={s3_cfg['session_token']}"
     clause = "JSON 'auto ignorecase'" if fmt == 'JSON' else fmt.upper()
     key = job.get('manifest_key', job['s3_key'])
     manifest = ' MANIFEST' if job.get('manifest_key') else ''
@@ -233,13 +235,11 @@ def load_to_redshift(job, s3_cfg, rs_cfg):
     if job['file_format'] == 'Iceberg': raise ValueError("Iceberg cannot be used on the Redshift route.")
     if s3_cfg['region'] != rs_cfg.get('region'):
         raise ValueError("Use an S3 bucket in the same region as Redshift for this POC route.")
-    client = boto3.client('redshift-data', region_name=rs_cfg['region'],
-                          aws_access_key_id=rs_cfg['access_key'], aws_secret_access_key=rs_cfg['secret_key'])
+    client = boto3.client('redshift-data', region_name=rs_cfg['region'], **boto3_credentials(rs_cfg))
     target = quote_identifier(job['rs_schema']) + '.' + quote_identifier(job['rs_table'])
     start = time.time()
     if not job.get('load_statement_id'):
-        s3 = boto3.client('s3', region_name=s3_cfg['region'], aws_access_key_id=s3_cfg['access_key'],
-                          aws_secret_access_key=s3_cfg['secret_key'])
+        s3 = boto3.client('s3', region_name=s3_cfg['region'], **boto3_credentials(s3_cfg))
         actual_region = s3.get_bucket_location(Bucket=s3_cfg['bucket']).get('LocationConstraint') or 'us-east-1'
         if actual_region == 'EU': actual_region = 'eu-west-1'
         if actual_region != rs_cfg['region']:
@@ -264,8 +264,7 @@ def load_to_redshift(job, s3_cfg, rs_cfg):
                 raise
         # Empty exports still implement the selected load mode, but need no COPY.
         if job['rows']:
-            s3 = boto3.client('s3', region_name=s3_cfg['region'], aws_access_key_id=s3_cfg['access_key'],
-                              aws_secret_access_key=s3_cfg['secret_key'])
+            s3 = boto3.client('s3', region_name=s3_cfg['region'], **boto3_credentials(s3_cfg))
             directory, _, filename = job['s3_key'].rpartition('/')
             job['manifest_key'] = f'{directory}/_manifests/{filename}.manifest'
             manifest = {'entries': [{'url': f"s3://{s3_cfg['bucket']}/{job['s3_key']}",
@@ -273,6 +272,8 @@ def load_to_redshift(job, s3_cfg, rs_cfg):
             s3.put_object(Bucket=s3_cfg['bucket'], Key=job['manifest_key'], Body=json.dumps(manifest).encode())
             sql = build_copy_sql(job, s3_cfg)
             job['copy_sql'] = sql.replace(s3_cfg['access_key'], '<access-key>').replace(s3_cfg['secret_key'], '<secret-key>')
+            if s3_cfg.get('session_token'):
+                job['copy_sql'] = job['copy_sql'].replace(s3_cfg['session_token'], '<session-token>')
             job['load_statement_id'] = client.execute_statement(
                 WorkgroupName=rs_cfg['workgroup'].split('.')[0].strip(), Database=rs_cfg['database'], Sql=sql,
                 ClientToken=_statement_token(job, 'copy'))['Id']
