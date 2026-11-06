@@ -83,6 +83,232 @@ def _format_bytes(b: int) -> str:
     return f"{b / 1024 ** 3:.3f} GB"
 
 
+# Error substrings that indicate a systemic failure: the same cause will almost
+# certainly break every remaining table, so the run should stop immediately to
+# save time and cost. Matched case-insensitively against the error text.
+_FATAL_FAILURE_SIGNALS = (
+    "permission denied",
+    "access denied",
+    "accessdenied",
+    "not authorized",
+    "external schema",
+    "spectrum",
+    "awsdatacatalog",
+    "invalidclienttoken",
+    "expiredtoken",
+    "token has expired",
+    "unrecognizedclient",
+    "signature",
+    "could not connect",
+    "connection refused",
+    "unable to connect",
+    "workgroup",
+    "cluster",
+    "schema",            # e.g. "permission denied for schema", "schema does not exist"
+    "credentials",
+    "region",
+)
+
+# Error substrings that indicate a per-table failure: specific to this one
+# table's data/size/shape, so the rest of the queue can still succeed. Checked
+# first; if one of these matches, the failure is treated as per-table even when
+# a broad fatal keyword also appears.
+_TABLE_FAILURE_SIGNALS = (
+    # Permission errors scoped to a single table/relation affect only that table.
+    # (Schema-level "permission denied for schema ..." stays fatal — see below.)
+    "permission denied for relation",
+    "permission denied for table",
+    "must be owner of relation",
+    "must be owner of table",
+    "row-count mismatch",
+    "row count mismatch",
+    "string length exceeds",
+    "value too long",
+    "invalid digit",
+    "invalid value",
+    "invalid date",
+    "invalid timestamp",
+    "overflow",
+    "numeric data overflow",
+    "100083",
+    "max file size",
+    "max_file_size",
+    "exceeds the maximum",
+    "load into table",
+    "verification failed",
+    # Column-count / schema-shape mismatch between the data file and the target
+    # table is specific to one table, even though the raw message says "Spectrum".
+    "unmatched number of columns",
+    "15007",
+    "column count mismatch",
+    "does not match",
+    # Column type in the target table does not fit the data file.
+    "incompatible parquet schema",
+    "error fetching values",
+    "code: 1205",
+    # Missing target table is specific to that table (a missing *schema* stays fatal).
+    "does not exist in redshift",
+    # A single column type Snowflake cannot unload (e.g. TIMESTAMP_LTZ to Parquet).
+    "not supported for unloading",
+)
+
+
+def _short_error(error_text: str, limit: int = 240) -> str:
+    """Condense a raw engine error for on-screen display. Full text still goes
+    to the operation log; the UI card only needs the first readable sentence.
+    Strips embedded S3 URLs and internal location/process noise.
+    """
+    text = " ".join((error_text or "").split())
+    # Drop noisy tails Redshift/Spectrum append after the useful part. Cut at the
+    # earliest marker that appears, not the first one we happen to check.
+    cut = len(text)
+    for marker in ("File name:", "query:", "location:", "process:"):
+        i = text.find(marker)
+        if i != -1:
+            cut = min(cut, i)
+    if cut < len(text):
+        text = text[:cut].rstrip(" .,") + "."
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
+def _classify_failure(error_text: str) -> str:
+    """Classify a migration error as 'fatal' (stop the whole run) or 'table'
+    (skip this table and keep going).
+
+    Per-table signals win over fatal ones, because a precise data error such as
+    "string length exceeds" is specific to one table even if its message also
+    mentions a schema or column. Anything that matches no per-table signal and
+    no fatal signal defaults to 'fatal' — the safe choice that preserves the
+    original stop-on-failure behaviour for unknown errors.
+    """
+    text = (error_text or "").lower()
+    for sig in _TABLE_FAILURE_SIGNALS:
+        if sig in text:
+            return "table"
+    for sig in _FATAL_FAILURE_SIGNALS:
+        if sig in text:
+            return "fatal"
+    return "fatal"
+
+
+def _arrow_to_redshift_type(dtype) -> str:
+    """Map a pyarrow type to the Redshift column type that a Parquet COPY accepts."""
+    import pyarrow as pa
+    t = pa.types
+    if t.is_boolean(dtype):
+        return "BOOLEAN"
+    if t.is_int8(dtype) or t.is_int16(dtype) or t.is_uint8(dtype):
+        return "SMALLINT"
+    if t.is_int32(dtype) or t.is_uint16(dtype):
+        return "INTEGER"
+    if t.is_int64(dtype) or t.is_uint32(dtype):
+        return "BIGINT"
+    if t.is_uint64(dtype):
+        return "DECIMAL(20,0)"
+    if t.is_float16(dtype) or t.is_float32(dtype):
+        return "REAL"
+    if t.is_float64(dtype):
+        return "DOUBLE PRECISION"
+    if t.is_decimal(dtype) and dtype.precision <= 38:
+        return f"DECIMAL({dtype.precision},{dtype.scale})"
+    if t.is_timestamp(dtype):
+        return "TIMESTAMPTZ" if dtype.tz else "TIMESTAMP"
+    if t.is_date(dtype):
+        return "DATE"
+    return "VARCHAR(65535)"
+
+
+def _infer_redshift_types(df):
+    """Redshift types derived from the same Arrow schema the Parquet file is
+    written with, so the auto-created table always matches the data file.
+    Returns None if the schema cannot be inferred (caller falls back to dtypes).
+    """
+    try:
+        import pyarrow as pa
+        schema = pa.Table.from_pandas(df, preserve_index=False).schema
+        return {
+            f.name: ("VARCHAR(65535)" if pa.types.is_null(f.type) else _arrow_to_redshift_type(f.type))
+            for f in schema
+        }
+    except Exception:
+        return None
+
+
+def _redshift_type_from_dtype(dtype_str: str) -> str:
+    """Fallback when no Arrow schema is available. Matches pandas dtype names
+    exactly; pandas 3 uses datetime64[us]/[s]/[ms], not only [ns]."""
+    d = (dtype_str or "object").lower()
+    if d.startswith("datetime64"):
+        return "TIMESTAMPTZ" if "utc" in d or "tz" in d else "TIMESTAMP"
+    if d in ("bool", "boolean"):
+        return "BOOLEAN"
+    if d in ("int8", "int16", "uint8"):
+        return "SMALLINT"
+    if d in ("int32", "uint16"):
+        return "INTEGER"
+    if d in ("int64", "uint32"):
+        return "BIGINT"
+    if d in ("float32",):
+        return "REAL"
+    if d in ("float64", "float"):
+        return "DOUBLE PRECISION"
+    if d.startswith("date32") or d.startswith("date64"):
+        return "DATE"
+    return "VARCHAR(65535)"
+
+
+def _build_create_sql(schema: str, table: str, cols, dtypes, rs_types=None,
+                      if_not_exists: bool = True) -> str:
+    rs_types = rs_types or {}
+    col_defs = [
+        f'"{c}" {rs_types.get(c) or _redshift_type_from_dtype((dtypes or {}).get(c, "object"))}'
+        for c in cols
+    ]
+    guard = "IF NOT EXISTS " if if_not_exists else ""
+    return f'CREATE TABLE {guard}"{schema}"."{table}" ({", ".join(col_defs)});'
+
+
+def _is_type_mismatch_error(error_text: str) -> bool:
+    """COPY errors that mean the target table's column types do not fit the file."""
+    low = (error_text or "").lower()
+    return any(s in low for s in (
+        "incompatible parquet schema",
+        "error fetching values",
+        "unmatched number of columns",
+        "15007",
+        "code: 1205",
+    ))
+
+
+def _serialize_dataframe(df, fmt: str) -> bytes:
+    """Serialize a DataFrame to PARQUET / ORC / JSON (NDJSON) / CSV bytes."""
+    import io
+    fmt = (fmt or "CSV").upper()
+    if fmt == "PARQUET":
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        pq_buf = io.BytesIO()
+        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), pq_buf,
+                       compression="snappy", coerce_timestamps="us", version="1.0")
+        return pq_buf.getvalue()
+    if fmt == "ORC":
+        import pyarrow as pa
+        import pyarrow.orc as orc
+        orc_buf = io.BytesIO()
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        table = table.cast(pa.schema([pa.field(f.name, pa.string() if pa.types.is_null(f.type) else f.type)
+                                      for f in table.schema]))
+        orc.write_table(table, orc_buf)
+        return orc_buf.getvalue()
+    if fmt == "JSON":
+        return df.to_json(orient="records", lines=True, date_format="iso", date_unit="us").encode("utf-8")
+    csv_buf = io.StringIO()
+    df.to_csv(csv_buf, index=False)
+    return csv_buf.getvalue().encode("utf-8")
+
+
 def _update_job(job_id: str, **kwargs):
     """Update fields on a specific job in the queue by id."""
     for job in st.session_state.job_queue:
@@ -218,6 +444,7 @@ def _extract_snowflake_to_s3_iceberg(job: dict, sf_cfg: dict, s3_cfg: dict) -> d
     df = pd.DataFrame(rows, columns=col_names)
     job["columns"] = list(df.columns)
     job["dtypes"] = {c: str(df[c].dtype) for c in df.columns}
+    job["rs_types"] = _infer_redshift_types(df)
     from iceberg_s3_writer import write_iceberg_table_to_s3
     res = write_iceberg_table_to_s3(
         df=df,
@@ -312,6 +539,7 @@ def _extract_databricks_to_s3_iceberg(job: dict, db_cfg: dict, s3_cfg: dict) -> 
     df = pd.DataFrame(rows, columns=col_names)
     job["columns"] = list(df.columns)
     job["dtypes"] = {c: str(df[c].dtype) for c in df.columns}
+    job["rs_types"] = _infer_redshift_types(df)
     from iceberg_s3_writer import write_iceberg_table_to_s3
     res = write_iceberg_table_to_s3(
         df=df,
@@ -385,28 +613,8 @@ def _extract_databricks_to_s3(job: dict, db_cfg: dict, s3_cfg: dict) -> dict:
     df = pd.DataFrame(rows, columns=col_names)
     job["columns"] = list(df.columns)
     job["dtypes"] = {c: str(df[c].dtype) for c in df.columns}
-    if fmt == "PARQUET":
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        pq_buf = io.BytesIO()
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), pq_buf,
-                       compression="snappy", coerce_timestamps="us", version="1.0")
-        body = pq_buf.getvalue()
-    elif fmt == "ORC":
-        import pyarrow as pa
-        import pyarrow.orc as orc
-        orc_buf = io.BytesIO()
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        table = table.cast(pa.schema([pa.field(f.name, pa.string() if pa.types.is_null(f.type) else f.type)
-                                      for f in table.schema]))
-        orc.write_table(table, orc_buf)
-        body = orc_buf.getvalue()
-    elif fmt == "JSON":
-        body = df.to_json(orient="records", lines=True, date_format="iso", date_unit="us").encode("utf-8")
-    else:
-        csv_buf = io.StringIO()
-        df.to_csv(csv_buf, index=False)
-        body = csv_buf.getvalue().encode("utf-8")
+    job["rs_types"] = _infer_redshift_types(df)
+    body = _serialize_dataframe(df, fmt)
 
     s3_client = boto3.client(
         "s3",
@@ -427,6 +635,60 @@ def _extract_databricks_to_s3(job: dict, db_cfg: dict, s3_cfg: dict) -> dict:
     }
 
 
+def _extract_snowflake_to_s3_python(job: dict, sf_cfg: dict, s3_cfg: dict) -> dict:
+    """Export a Snowflake table to S3 as PARQUET / CSV / JSON / ORC by reading rows
+    in Python, like the Iceberg path.
+
+    Unlike Snowflake's server-side COPY INTO, this works for every Snowflake type
+    (TIMESTAMP_LTZ/TZ cannot be unloaded to Parquet), supports ORC, and records
+    the column types so the Redshift table is auto-created to match the file.
+    """
+    import time
+    import boto3
+    import snowflake.connector
+    import pandas as pd
+
+    start_time = time.time()
+    sf_schema = job["sf_schema"]
+    sf_table = job["sf_table"]
+    fmt = job["file_format"].upper()
+
+    _log(f"{fmt} export: connecting to Snowflake for {sf_schema}.{sf_table}")
+    conn = snowflake.connector.connect(**sf_cfg)
+    cursor = conn.cursor()
+    try:
+        if job.get("source_query"):
+            query = job["source_query"]
+        elif job.get("use_filters") and job.get("filter_col"):
+            query = f'SELECT * FROM "{sf_schema}"."{sf_table}" WHERE {job["filter_col"].strip()}'
+        else:
+            query = f'SELECT * FROM "{sf_schema}"."{sf_table}"'
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        col_names = [desc[0] for desc in cursor.description]
+    finally:
+        cursor.close()
+        conn.close()
+
+    df = pd.DataFrame(rows, columns=col_names)
+    job["columns"] = list(df.columns)
+    job["dtypes"] = {c: str(df[c].dtype) for c in df.columns}
+    job["rs_types"] = _infer_redshift_types(df)
+    body = _serialize_dataframe(df, fmt)
+
+    boto3.client(
+        "s3",
+        region_name=s3_cfg["region"],
+        **boto3_credentials(s3_cfg),
+    ).put_object(Bucket=s3_cfg["bucket"], Key=job["s3_key"], Body=body)
+
+    return {
+        "rows": len(df),
+        "bytes": len(body),
+        "duration_secs": round(time.time() - start_time, 2),
+    }
+
+
 def _extract_snowflake_to_s3(job: dict, sf_cfg: dict, s3_cfg: dict) -> dict:
     """
     Use Snowflake's COPY INTO to unload data directly into S3.
@@ -444,6 +706,21 @@ def _extract_snowflake_to_s3(job: dict, sf_cfg: dict, s3_cfg: dict) -> dict:
     # ── Route Iceberg exports to the dedicated function ───────────────────────
     if job.get("file_format", "").upper() == "ICEBERG":
         return _extract_snowflake_to_s3_iceberg(job, sf_cfg, s3_cfg)
+
+    # Partitioned exports need one server-side COPY per key. Everything else is read
+    # in Python so column types are known (auto-create, TIMESTAMP_LTZ/TZ, ORC).
+    _has_partitions = bool(job.get("use_partitions")) and any(
+        c.strip() for c in (job.get("partition_cols") or "").split(","))
+    if not _has_partitions:
+        return _extract_snowflake_to_s3_python(job, sf_cfg, s3_cfg)
+
+    # Snowflake's COPY INTO <location> can only unload CSV, JSON and PARQUET.
+    # Fail before connecting rather than after a confusing Snowflake SQL error.
+    if job.get("file_format", "").upper() == "ORC":
+        raise RuntimeError(
+            "Snowflake cannot unload partitioned data to ORC (supported: Iceberg, Parquet, CSV, JSON). "
+            "Turn off partitioning for this table, or choose another format."
+        )
 
     import snowflake.connector
     import time
@@ -762,27 +1039,9 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
     cols = job.get("columns", [])
     dtypes = job.get("dtypes", {})
     if not table_exists and cols:
-        type_map = {
-            "int64": "BIGINT",
-            "int32": "INTEGER",
-            "int16": "SMALLINT",
-            "float64": "DOUBLE PRECISION",
-            "float32": "REAL",
-            "bool": "BOOLEAN",
-            "datetime64[ns]": "TIMESTAMP",
-            "timestamp": "TIMESTAMP",
-            "date": "DATE",
-        }
-        col_defs = []
-        for c in cols:
-            dt = dtypes.get(c, "object").lower()
-            rs_type = "VARCHAR(65535)"
-            for k, v in type_map.items():
-                if k in dt:
-                    rs_type = v
-                    break
-            col_defs.append(f'"{c}" {rs_type}')
-        create_sql = f'CREATE TABLE IF NOT EXISTS "{rs_schema}"."{rs_table}" ({", ".join(col_defs)});'
+        # Types come from the Arrow schema of the exported file (job["rs_types"]),
+        # so DECIMAL/DATE/TIMESTAMP columns match the Parquet data exactly.
+        create_sql = _build_create_sql(rs_schema, rs_table, cols, dtypes, job.get("rs_types"))
         _log(f"Target table '{rs_schema}.{rs_table}' not found in Redshift — auto-creating...", "info")
         try:
             _execute_sync(create_sql, timeout=30)
@@ -849,6 +1108,12 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
         DATEFORMAT 'auto'
         EMPTYASNULL
         BLANKSASNULL"""
+    elif fmt == "JSON":
+        s3_path = f"s3://{s3_bucket}/{s3_key}"
+        # Redshift requires a JSON argument ('auto' alone is a syntax error without
+        # it) and matches keys case-sensitively; source columns are upper case while
+        # Redshift columns are stored lower case, so ignore case.
+        format_clause = "FORMAT AS JSON 'auto ignorecase' TIMEFORMAT 'auto' DATEFORMAT 'auto'"
     else:
         s3_path = f"s3://{s3_bucket}/{s3_key}"
         format_clause = f"FORMAT AS {fmt}"
@@ -872,10 +1137,53 @@ def _load_s3_to_redshift(job: dict, s3_cfg: dict, rs_cfg: dict) -> dict:
 
     _log(f"COPY path: {s3_path}")
 
+    def _rebuild_empty_owned_table() -> bool:
+        """Drop and recreate the target with types taken from the exported file.
+
+        Only when the table is empty AND owned by the identity this app runs as,
+        so a table holding data, or one owned by someone else, is never touched.
+        """
+        if not job.get("columns"):
+            return False
+        try:
+            if _target_count() != 0:
+                return False
+            s = rs_schema.lower().replace("'", "''")
+            t = rs_table.lower().replace("'", "''")
+            own = _execute_sync(
+                f"SELECT 1 FROM pg_tables WHERE LOWER(schemaname) = '{s}' "
+                f"AND LOWER(tablename) = '{t}' AND tableowner = current_user",
+                timeout=30,
+            )
+            if not own.get("HasResultSet") or not client.get_statement_result(Id=own["Id"]).get("Records"):
+                return False
+            _execute_sync(f"DROP TABLE {target}", timeout=30)
+            _execute_sync(
+                _build_create_sql(rs_schema, rs_table, job["columns"], job.get("dtypes"),
+                                  job.get("rs_types"), if_not_exists=False),
+                timeout=30,
+            )
+            job["ddl_rebuilt"] = True
+            _log(f"Rebuilt empty table '{rs_schema}.{rs_table}' with column types from the exported file; retrying COPY", "warn")
+            return True
+        except Exception as exc:
+            _log(f"Could not auto-rebuild '{rs_schema}.{rs_table}': {exc}", "warn")
+            return False
+
     start_time = time.time()
+    copy_err = None
     try:
         _execute_sync(copy_command, timeout=3600, statement_key="load_statement_id")
-    except Exception as copy_err:
+    except Exception as exc:
+        copy_err = exc
+    if (copy_err is not None and _is_type_mismatch_error(str(copy_err))
+            and not job.get("ddl_rebuilt") and _rebuild_empty_owned_table()):
+        copy_err = None
+        try:
+            _execute_sync(copy_command, timeout=3600, statement_key="load_statement_id")
+        except Exception as exc:
+            copy_err = exc
+    if copy_err is not None:
         err_str = str(copy_err)
         if "external schema" in err_str.lower():
             raise RuntimeError(
@@ -988,6 +1296,12 @@ def run_migration(
     total_bytes = 0
     total_secs  = 0.0
 
+    # Safety valve: per-table permission failures are skipped individually, but
+    # if several pile up in one run it usually means a blanket privilege gap, so
+    # escalate to a full stop instead of failing every remaining table.
+    perm_skip_count = 0
+    PERM_SKIP_LIMIT = 3
+
     run_start = time.time()
     _log(f"Migration started · {total} tables queued", "info")
 
@@ -1039,12 +1353,21 @@ def run_migration(
             )
         except Exception as e:
             err = f"{'BigQuery' if (bq_run or job.get('source_type') == 'bigquery') else 'Source'}→S3 failed: {e}"
-            _update_job(job["id"], status="failed", error=err)
+            kind = _classify_failure(err)
+            _update_job(job["id"], status="failed", error=err, fail_kind=kind)
             _mark_checkpoint(job["id"], "failed")
-            _log(f"[{idx+1}/{total}] ERROR · {job['id']} · {err}", "err")
+            _log(f"[{idx+1}/{total}] ERROR ({kind}) · {job['id']} · {err}", "err")
             failed += 1
             overall_pct = int(((idx + 1) / total) * 100)
             progress_placeholder.progress(overall_pct, text=f"Processing… {idx+1}/{total}")
+            if kind == "fatal":
+                _log(
+                    "Stopping run — systemic extract error likely affects all remaining tables. "
+                    "Fix the cause, then click Resume to retry.",
+                    "warn",
+                )
+                break
+            # Per-table extract problem — skip this table and keep going.
             continue
 
         # ── Phase 2: S3 → Redshift (skipped when pipeline_destination is S3-only) ──
@@ -1062,12 +1385,38 @@ def run_migration(
                     rs_result = _load_s3_to_redshift(job, s3_cfg, rs_cfg)
             except Exception as e:
                 err = f"S3→RS failed: {e}"
-                _update_job(job["id"], status="failed", error=err)
+                kind = _classify_failure(err)
+                _update_job(job["id"], status="failed", error=err, fail_kind=kind)
                 _mark_checkpoint(job["id"], "failed")
-                _log(f"[{idx+1}/{total}] ERROR · {job['id']} · {err}", "err")
+                _log(
+                    f"[{idx+1}/{total}] ERROR ({kind}) · {job['id']} · {err}",
+                    "err",
+                )
                 failed += 1
                 overall_pct = int(((idx + 1) / total) * 100)
                 progress_placeholder.progress(overall_pct, text=f"Processing… {idx+1}/{total}")
+                if kind == "table":
+                    # Escalate if per-table permission failures keep recurring —
+                    # that pattern points to a blanket privilege gap, not one table.
+                    if "permission denied" in err.lower() or "must be owner" in err.lower():
+                        perm_skip_count += 1
+                        if perm_skip_count >= PERM_SKIP_LIMIT:
+                            _log(
+                                f"Stopping run — {perm_skip_count} tables failed with permission "
+                                f"errors, which indicates a missing table-level GRANT across the "
+                                f"schema rather than a single-table issue. Grant privileges, then Resume.",
+                                "warn",
+                            )
+                            break
+                    # Per-table problem — skip this table and keep migrating the rest.
+                    continue
+                # Systemic failure — the same cause will break the remaining
+                # tables, so stop now (preserves the original cost-saving behaviour).
+                _log(
+                    "Stopping run — systemic error likely affects all remaining tables. "
+                    "Fix the cause, then click Resume to retry.",
+                    "warn",
+                )
                 break
 
         # ── Mark done ──
@@ -1244,7 +1593,7 @@ def render_execution_controls(
             job["duration_secs"] = 0.0
             job["error"]         = ""
             for _k in ("export_complete", "load_statement_id", "truncate_statement_id",
-                       "target_rows_before", "target_rows_after"):
+                       "target_rows_before", "target_rows_after", "ddl_rebuilt"):
                 job.pop(_k, None)
             # Clear BigQuery-specific idempotency keys so Redshift Data API retries cleanly
             if job.get("source_type") == "bigquery":
@@ -1292,37 +1641,106 @@ def render_execution_controls(
                 f"**{rows:,} rows** · **{size}** · **{secs}s**"
             )
         else:
-            st.warning(
-                f"⚠ Migration finished with issues — "
-                f"{done} succeeded, {failed} failed, {summary.get('pending', 0)} pending. "
-                f"See below and check the Monitoring tab for details. Click Resume to retry failed tables."
-            )
-            # Render detailed error cards directly on the active screen for immediate visibility
-            for j in queue:
-                if j.get("status") == "failed":
+            # Split failures into the two buckets so the message matches what
+            # actually happened: a systemic stop vs. individual tables skipped.
+            failed_jobs = [j for j in queue if j.get("status") == "failed"]
+            fatal_jobs  = [j for j in failed_jobs if j.get("fail_kind") == "fatal"]
+            table_jobs  = [j for j in failed_jobs if j.get("fail_kind") != "fatal"]
+            pending     = summary.get("pending", 0)
+
+            if fatal_jobs:
+                st.warning(
+                    f"⛔ Migration stopped on a systemic error — "
+                    f"{done} succeeded, {failed} failed, {pending} not attempted. "
+                    f"The cause below affects every remaining table. Fix it, then click "
+                    f"**Resume** to continue from where it stopped."
+                )
+            else:
+                st.warning(
+                    f"⚠ Migration finished — {done} succeeded, {len(table_jobs)} need attention. "
+                    f"The rest of the queue was migrated. These tables were skipped for "
+                    f"table-specific reasons; fix each one and click **Resume** to retry only them."
+                )
+
+            def _render_fix_hint(err_msg: str, j: dict):
+                low = err_msg.lower()
+                if "unmatched number of columns" in low or "column count mismatch" in low:
+                    st.info(
+                        "💡 **Root Cause & Fix:** The exported data file and the target Redshift table "
+                        "have a different number of columns, so the positional Parquet `COPY` can't line them up.\n\n"
+                        "**How to resolve:**\n"
+                        f"1. Compare columns: the target `{j.get('rs_schema') or 'public'}.{j.get('rs_table') or j.get('id')}` "
+                        "vs. the exported file.\n"
+                        "2. If the **target** table is the stale one, `DROP TABLE` it and click **Reset & Start Over** so it is recreated to match the source.\n"
+                        "3. If the **export** is missing columns, use **Clear Queue**, rebuild the queue so all source columns are selected, then run."
+                    )
+                elif ("incompatible parquet schema" in low or "error fetching values" in low
+                        or "15007" in low or "code: 1205" in low):
+                    st.info(
+                        "💡 **Root Cause & Fix:** A column type in the Redshift table does not fit the "
+                        "data file (for example a `DATE` or `VARCHAR` column receiving timestamps or decimals).\n\n"
+                        "**How to resolve:** If the table is empty and was created by this tool, it is rebuilt "
+                        "automatically on the next **Resume**. If it holds data or belongs to another user, "
+                        "alter the column type or drop the table, then click **Resume**."
+                    )
+                elif any(k in low for k in ("external schema", "spectrum external", "awsdatacatalog")):
+                    st.info(
+                        "💡 **Root Cause & Fix:** Target schema is an external schema (e.g. `awsdatacatalog` or Spectrum). "
+                        "Amazon Redshift `COPY` only loads into standard local tables (such as `public`).\n\n"
+                        "**How to resolve:**\n"
+                        "1. Go to the **Table Discovery** tab.\n"
+                        "2. Under Step 3, set **Target Redshift Schema** to **`public`** (or select **Iceberg** format).\n"
+                        "3. Click **📋 Build Migration Queue**, then re-run."
+                    )
+                elif "permission denied" in low:
+                    st.info(
+                        "💡 **Root Cause & Fix:** The Redshift database user mapped to your AWS identity "
+                        "lacks rights on the target schema.\n\n"
+                        "**How to resolve:** Have a Redshift admin run "
+                        f"`GRANT USAGE, CREATE ON SCHEMA {j.get('rs_schema') or 'public'} TO \"IAMR:<your-role>\";` "
+                        "then click **Resume**."
+                    )
+                elif "relation" in low and "does not exist" in low:
+                    st.info(
+                        f"💡 **Root Cause & Fix:** The target table does not exist in Redshift.\n\n"
+                        f"**How to resolve:** Create the target table in schema `{j.get('rs_schema') or 'public'}` in Redshift before loading, or ensure source discovery detected columns."
+                    )
+                elif "row-count mismatch" in low or "row count mismatch" in low:
+                    st.info(
+                        "💡 **Root Cause & Fix:** The loaded row count did not match the exported count — "
+                        "usually duplicate rows from a previous attempt left in the target.\n\n"
+                        "**How to resolve:** Use **TRUNCATE & LOAD** mode (or empty the target table), then click **Resume**."
+                    )
+                elif "100083" in err_msg or "max file size" in low:
+                    st.info(
+                        "💡 **Root Cause & Fix:** Snowflake single-file limit (16MB default) was reached. "
+                        "Unload parameters have been automatically upgraded to 5GB max file size with multi-part fallback. "
+                        "Click **Resume** to re-run the failed table."
+                    )
+                elif "string length exceeds" in low or "value too long" in low:
+                    st.info(
+                        "💡 **Root Cause & Fix:** A source value is wider than the target VARCHAR column.\n\n"
+                        "**How to resolve:** Widen the target column, or rebuild the queue so the column is sized for the data."
+                    )
+                elif "source→s3" in low:
+                    st.info(
+                        "💡 **Root Cause & Fix:** Data export from Source to S3 failed. Check source connectivity, query permissions, or S3 bucket write permissions."
+                    )
+
+            if fatal_jobs:
+                st.markdown("#### ⛔ Systemic failure — run stopped")
+                for j in fatal_jobs:
                     err_msg = j.get("error") or "Unknown error"
-                    st.error(f"❌ **Failed Table: `{j['id']}`**\n\n`{err_msg}`")
-                    if any(k in err_msg.lower() for k in ("external", "spectrum", "awsdatacatalog")):
-                        st.info(
-                            "💡 **Root Cause & Fix:** Target schema is an external schema (e.g. `awsdatacatalog` or Spectrum). "
-                            "Amazon Redshift `COPY` only loads into standard local tables (such as `public`).\n\n"
-                            "**How to resolve:**\n"
-                            "1. Go to the **Table Discovery** tab.\n"
-                            "2. Under Step 3, set **Target Redshift Schema** to **`public`** (or select **Iceberg** format).\n"
-                            "3. Click **📋 Build Migration Queue**, then re-run."
-                        )
-                    elif "relation" in err_msg.lower() and "does not exist" in err_msg.lower():
-                        st.info(
-                            f"💡 **Root Cause & Fix:** The target table does not exist in Redshift.\n\n"
-                            f"**How to resolve:** Create the target table in schema `{j.get('rs_schema') or 'public'}` in Redshift before loading, or ensure source discovery detected columns."
-                        )
-                    elif "100083" in err_msg or "max file size" in err_msg.lower():
-                        st.info(
-                            "💡 **Root Cause & Fix:** Snowflake single-file limit (16MB default) was reached. "
-                            "Unload parameters have been automatically upgraded to 5GB max file size with multi-part fallback. "
-                            "Click **Resume** to re-run the failed table."
-                        )
-                    elif "source→s3" in err_msg.lower():
-                        st.info(
-                            "💡 **Root Cause & Fix:** Data export from Source to S3 failed. Check source connectivity, query permissions, or S3 bucket write permissions."
-                        )
+                    st.error(f"❌ **Failed Table: `{j['id']}`**\n\n{_short_error(err_msg)}")
+                    with st.expander("Full error detail"):
+                        st.code(err_msg)
+                    _render_fix_hint(err_msg, j)
+
+            if table_jobs:
+                st.markdown(f"#### ⚠ Tables needing attention ({len(table_jobs)})")
+                for j in table_jobs:
+                    err_msg = j.get("error") or "Unknown error"
+                    st.error(f"❌ **Skipped Table: `{j['id']}`**\n\n{_short_error(err_msg)}")
+                    with st.expander("Full error detail"):
+                        st.code(err_msg)
+                    _render_fix_hint(err_msg, j)
