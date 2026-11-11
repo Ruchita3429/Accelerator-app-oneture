@@ -11,6 +11,7 @@ ENV/
 
 # Streamlit local secrets
 .streamlit/secrets.toml
+.migration_state/
 
 # Test and tooling caches
 .pytest_cache/

@@ -54,7 +54,8 @@ import pyarrow_compat   # Stubs pyarrow._compute + pyarrow._dataset before panda
 
 import streamlit as st
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+import uuid
 
 from pipeline_routes import is_bigquery, s3_only, source_name, formats_for, resolve_route
 from aws_credentials import boto3_credentials
@@ -330,13 +331,137 @@ def _is_checkpointed(job_id: str) -> bool:
     return st.session_state.checkpoint.get(job_id) == "done"
 
 
+def _metrics_call(method, *args, **kwargs):
+    """Write metrics without masking pipeline outcomes; persist/report writer errors."""
+    try:
+        from metrics_repository import get_metrics_repository, sanitize_error
+        return getattr(get_metrics_repository(), method)(*args, **kwargs)
+    except Exception as exc:
+        message = f"DuckDB metrics {method} failed: {sanitize_error(exc)}"
+        st.session_state["metrics_error"] = message
+        _log(message, "err")
+        return None
+
+
+def _metrics_begin_run(source, target, stage="queued"):
+    run_id = st.session_state.get("migration_run_id") or uuid.uuid4().hex
+    st.session_state["migration_run_id"] = run_id
+    _metrics_call("start_run", run_id, source, target, stage)
+    return run_id
+
+
+def metrics_run_id_for_transfer():
+    """Reuse an unfinished queued run, otherwise start a fresh manual run ID."""
+    run_id = st.session_state.get("migration_run_id")
+    if run_id:
+        status = _metrics_call("run_status", run_id)
+        if status and status[0] in ("completed", "failed", "reset"):
+            run_id = None
+    if not run_id:
+        run_id = uuid.uuid4().hex
+        st.session_state["migration_run_id"] = run_id
+    return run_id
+
+
+def _metrics_begin_attempt(run_id, job, source, target, stage, started_at=None,
+                           operation="pipeline"):
+    started_at = started_at or datetime.now(timezone.utc).isoformat()
+    attempt_id = _metrics_call(
+        "start_attempt", run_id, job["id"], source, target, stage,
+        started_at, operation
+    )
+    if attempt_id:
+        job["metrics_attempt_id"] = attempt_id
+        job["metrics_attempt_started_at"] = started_at
+    return attempt_id
+
+
+def _metrics_secrets(*configs):
+    sensitive_names = ("password", "secret", "token", "access_key")
+    return tuple(
+        str(value)
+        for config in configs if isinstance(config, dict)
+        for key, value in config.items()
+        if any(name in str(key).lower() for name in sensitive_names)
+        and value
+    )
+
+
+def _upload_metrics_snapshot(run_id, s3_cfg):
+    st.session_state["metrics_backup_run_id"] = run_id
+    snapshot = _metrics_call("checkpoint_snapshot", run_id)
+    if snapshot is None:
+        message = "Could not checkpoint the DuckDB metrics snapshot; see the metrics error above."
+        st.session_state["metrics_backup_error"] = message
+        _log(message, "err")
+        return False
+    bucket = (s3_cfg or {}).get("bucket", "").strip()
+    if not bucket:
+        message = "Metrics snapshot was checkpointed locally but not uploaded: S3 bucket is not configured."
+        st.session_state["metrics_backup_error"] = message
+        _log(message, "warn")
+        return False
+    try:
+        import boto3
+        from aws_credentials import boto3_credentials
+
+        prefix = (s3_cfg.get("prefix") or "").strip("/")
+        now = datetime.now(timezone.utc)
+        date_path = now.strftime("%Y/%m/%d")
+        timestamp = now.strftime("%Y%m%dT%H%M%S_%fZ")
+        key_parts = [part for part in (
+            prefix, "_databridge_metrics", date_path, f"{timestamp}_{run_id}.json"
+        ) if part]
+        key = "/".join(key_parts)
+        boto3.client(
+            "s3",
+            region_name=s3_cfg["region"],
+            **boto3_credentials(s3_cfg),
+        ).put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=snapshot,
+            ContentType="application/json",
+        )
+    except Exception as exc:
+        from metrics_repository import sanitize_error
+        message = f"Metrics snapshot upload failed: {sanitize_error(exc, _metrics_secrets(s3_cfg))}"
+        st.session_state["metrics_backup_error"] = message
+        _log(message, "err")
+        return False
+    st.session_state.pop("metrics_backup_error", None)
+    st.session_state.pop("metrics_backup_run_id", None)
+    st.session_state["metrics_backup_status"] = f"s3://{bucket}/{key}"
+    _log(f"Metrics snapshot uploaded to s3://{bucket}/{key}", "ok")
+    return True
+
+
+def retry_metrics_snapshot(run_id, s3_cfg):
+    """Retry the versioned S3 export for an already committed DuckDB run."""
+    return _upload_metrics_snapshot(run_id, s3_cfg)
+
+
+def _metrics_finish_run(run_id, status, stage, s3_cfg, error_details=None, secrets=()):
+    if not run_id:
+        return
+    _metrics_call(
+        "finish_run", run_id, status=status, current_stage=stage,
+        error_details=error_details, secrets=secrets,
+    )
+    _upload_metrics_snapshot(run_id, s3_cfg)
+
+
 def record_manual_transfer(stage, *, source_schema=None, source_table=None,
-                           s3_key=None, error="", **metrics):
+                           s3_key=None, error="", metrics_run_id=None,
+                           metrics_source=None, metrics_target=None,
+                           metrics_started_at=None, metrics_secrets=(),
+                           **metrics):
     """Keep the existing queue/monitor in sync with the two manual transfer tabs."""
     queue = st.session_state.get("job_queue", [])
     source = st.session_state.get("source_type", "Snowflake")
     route = resolve_route(st.session_state.get("pipeline_destination", "Source → S3 → Redshift"), source)
     matched = False
+    matched_job = None
     for job in queue:
         if stage == "export":
             matches = (job.get("source_type", source).lower() == source.lower()
@@ -348,6 +473,7 @@ def record_manual_transfer(stage, *, source_schema=None, source_table=None,
         if not matches:
             continue
         matched = True
+        matched_job = job
         _init_checkpoint()
         if error:
             job.update(status="failed", phase=f"{stage} failed", error=error)
@@ -366,6 +492,53 @@ def record_manual_transfer(stage, *, source_schema=None, source_table=None,
             job.update(metrics, s3_key=s3_key, status="done" if complete else "pending",
                        phase="done" if complete else "exported to S3; awaiting Redshift", error="")
             _mark_checkpoint(job["id"], "done" if complete else "pending")
+    target_schema = metrics.get("rs_schema") or (matched_job or {}).get("rs_schema", "")
+    target_table = metrics.get("rs_table") or (matched_job or {}).get("rs_table", "")
+    target = "S3" if s3_only(route) else f"{target_schema}.{target_table}".strip(".")
+    metrics_source = metrics_source or source
+    target = metrics_target or target
+    run_id = metrics_run_id or st.session_state.get("migration_run_id")
+    if run_id and not metrics_run_id:
+        run_status = _metrics_call("run_status", run_id)
+        if run_status and run_status[0] in ("completed", "failed", "reset"):
+            run_id = None
+    if not run_id:
+        st.session_state["migration_run_id"] = None
+        run_id = _metrics_begin_run(metrics_source, target, stage)
+    else:
+        st.session_state["migration_run_id"] = run_id
+        _metrics_call("start_run", run_id, metrics_source, target, stage)
+    attempt_job_id = (matched_job or {}).get("id") or (
+        f"{source_schema or 'unknown'}.{source_table or (s3_key or 'transfer')}"
+    )
+    attempt_id = _metrics_begin_attempt(
+        run_id, {"id": attempt_job_id}, metrics_source, target, stage,
+        metrics_started_at, stage,
+    )
+    if attempt_id:
+        duration = metrics.get("duration_secs", metrics.get("rs_duration_secs"))
+        row_count = metrics.get("rows", (matched_job or {}).get("rows"))
+        byte_count = metrics.get("bytes", (matched_job or {}).get("bytes"))
+        _metrics_call(
+            "finish_attempt",
+            attempt_id,
+            status="failed" if error else "done",
+            current_stage=f"{stage} failed" if error else f"{stage} complete",
+            started_at=metrics_started_at or datetime.now(timezone.utc).isoformat(),
+            duration_seconds=duration,
+            rows_read=row_count if stage == "export" else None,
+            rows_written=(
+                row_count if stage == "export" and (s3_only(route) or target == "S3") else
+                metrics.get("rs_rows") if stage == "load" else
+                None
+            ),
+            rows_rejected=None,
+            bytes_processed=byte_count if stage == "export" else None,
+            watermark=(matched_job or {}).get("watermark"),
+            validation_result="not_run",
+            error_details=error or None,
+            secrets=metrics_secrets,
+        )
     if matched:
         done = [j for j in queue if j.get("status") == "done"]
         failed = sum(j.get("status") == "failed" for j in queue)
@@ -378,6 +551,15 @@ def record_manual_transfer(stage, *, source_schema=None, source_table=None,
             total_rows=sum(j.get("rows", 0) for j in done), total_bytes=size,
             total_secs=seconds, throughput=int(size / seconds) if seconds else 0,
             finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if st.session_state.migration_done and not metrics_run_id:
+            _metrics_finish_run(run_id, "completed", "completed", {})
+
+
+def finalize_metrics_run(run_id, source, target, status, s3_cfg, error_details=None):
+    """Checkpoint and export a manually executed transfer run."""
+    st.session_state["migration_run_id"] = run_id
+    _metrics_call("start_run", run_id, source, target, "finalizing")
+    _metrics_finish_run(run_id, status, status, s3_cfg, error_details)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1289,6 +1471,8 @@ def run_migration(
 
     st.session_state.migration_running = True
     st.session_state.migration_done    = False
+    run_target = "S3" if s3_only(route) else "Redshift"
+    metrics_run_id = _metrics_begin_run(active_source, run_target, "starting")
 
     completed = 0
     failed    = 0
@@ -1328,6 +1512,17 @@ def run_migration(
         )
 
         job_start = time.time()
+        metrics_started_at = datetime.now(timezone.utc).isoformat()
+        source_label = source_name(job) if job.get("source_type") == "bigquery" else (
+            f"{job.get('source_schema', job.get('sf_schema', ''))}."
+            f"{job.get('source_table', job.get('sf_table', ''))}"
+        )
+        target_label = "S3" if s3_only(route) else (
+            f"{job.get('rs_schema', '')}.{job.get('rs_table', '')}".strip(".")
+        )
+        metrics_attempt_id = _metrics_begin_attempt(
+            metrics_run_id, job, source_label, target_label, "source_to_s3"
+        )
 
         # ── Phase 1: Source → S3 ──
         try:
@@ -1351,10 +1546,35 @@ def run_migration(
                 bytes=sf_result["bytes"],
                 export_complete=True,
             )
+            if metrics_attempt_id:
+                _metrics_call(
+                    "update_attempt",
+                    metrics_attempt_id,
+                    current_stage="s3_exported",
+                    rows_read=sf_result["rows"],
+                    bytes_processed=sf_result["bytes"],
+                    watermark=job.get("watermark"),
+                )
         except Exception as e:
             err = f"{'BigQuery' if (bq_run or job.get('source_type') == 'bigquery') else 'Source'}→S3 failed: {e}"
             kind = _classify_failure(err)
             _update_job(job["id"], status="failed", error=err, fail_kind=kind)
+            if metrics_attempt_id:
+                _metrics_call(
+                    "finish_attempt",
+                    metrics_attempt_id,
+                    status="failed",
+                    current_stage="source_to_s3_failed",
+                    started_at=metrics_started_at,
+                    rows_read=None,
+                    rows_written=None,
+                    rows_rejected=None,
+                    bytes_processed=None,
+                    watermark=job.get("watermark"),
+                    validation_result="not_run",
+                    error_details=err,
+                    secrets=_metrics_secrets(sf_cfg, s3_cfg, rs_cfg, db_cfg),
+                )
             _mark_checkpoint(job["id"], "failed")
             _log(f"[{idx+1}/{total}] ERROR ({kind}) · {job['id']} · {err}", "err")
             failed += 1
@@ -1376,6 +1596,12 @@ def run_migration(
             rs_result = {"rs_rows": 0, "rs_duration_secs": 0}
         else:
             try:
+                if metrics_attempt_id:
+                    _metrics_call(
+                        "update_attempt",
+                        metrics_attempt_id,
+                        current_stage="redshift_load",
+                    )
                 _log(f"[{idx+1}/{total}] Load  · {job['id']}", "info")
                 if bq_run or job.get("source_type") == "bigquery":
                     from bigquery_migration import load_to_redshift as _bq_load
@@ -1387,6 +1613,22 @@ def run_migration(
                 err = f"S3→RS failed: {e}"
                 kind = _classify_failure(err)
                 _update_job(job["id"], status="failed", error=err, fail_kind=kind)
+                if metrics_attempt_id:
+                    _metrics_call(
+                        "finish_attempt",
+                        metrics_attempt_id,
+                        status="failed",
+                        current_stage="redshift_load_failed",
+                        started_at=metrics_started_at,
+                        rows_read=sf_result["rows"],
+                        rows_written=None,
+                        rows_rejected=None,
+                        bytes_processed=sf_result["bytes"],
+                        watermark=job.get("watermark"),
+                        validation_result="not_run",
+                        error_details=err,
+                        secrets=_metrics_secrets(sf_cfg, s3_cfg, rs_cfg, db_cfg),
+                    )
                 _mark_checkpoint(job["id"], "failed")
                 _log(
                     f"[{idx+1}/{total}] ERROR ({kind}) · {job['id']} · {err}",
@@ -1429,6 +1671,25 @@ def run_migration(
             error="",
         )
         _mark_checkpoint(job["id"], "done")
+        if metrics_attempt_id:
+            _metrics_call(
+                "finish_attempt",
+                metrics_attempt_id,
+                status="done",
+                current_stage="completed",
+                started_at=metrics_started_at,
+                rows_read=sf_result["rows"],
+                rows_written=(
+                    sf_result["rows"] if s3_only(route) else
+                    rs_result.get("rs_rows", sf_result["rows"])
+                ),
+                rows_rejected=None,
+                bytes_processed=sf_result["bytes"],
+                watermark=job.get("watermark"),
+                validation_result=(
+                    "passed" if job.get("target_rows_after") is not None else "not_run"
+                ),
+            )
 
         total_rows  += sf_result["rows"]
         total_bytes += sf_result["bytes"]
@@ -1470,6 +1731,21 @@ def run_migration(
         "throughput":   int(total_bytes / wall_secs) if wall_secs > 0 else 0,
         "finished_at":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    run_status = (
+        "completed" if st.session_state.migration_done else
+        "failed" if failed and completed == 0 else "partial"
+    )
+    run_error = "; ".join(
+        job.get("error", "") for job in queue if job.get("status") == "failed"
+    ) or None
+    _metrics_finish_run(
+        metrics_run_id,
+        run_status,
+        "completed" if run_status == "completed" else "incomplete",
+        s3_cfg,
+        run_error,
+        _metrics_secrets(sf_cfg, s3_cfg, rs_cfg, db_cfg),
+    )
 
     _log(
         f"Migration {'complete' if st.session_state.migration_done else 'incomplete'} · {completed}/{total} succeeded · "
@@ -1581,6 +1857,10 @@ def render_execution_controls(
     # ── Handle button actions ──────────────────────────────────────────────
 
     if reset_clicked:
+        previous_run_id = st.session_state.get("migration_run_id")
+        if previous_run_id:
+            _metrics_finish_run(previous_run_id, "reset", "reset", s3_cfg)
+        st.session_state["migration_run_id"] = None
         st.session_state.checkpoint       = {}
         st.session_state.migration_done   = False
         st.session_state.migration_running= False
@@ -1608,11 +1888,15 @@ def render_execution_controls(
         st.rerun()
 
     if clear_clicked:
+        previous_run_id = st.session_state.get("migration_run_id")
+        if previous_run_id:
+            _metrics_finish_run(previous_run_id, "reset", "queue_cleared", s3_cfg)
         st.session_state.job_queue         = []
         st.session_state.checkpoint        = {}
         st.session_state.migration_done    = False
         st.session_state.migration_running = False
         st.session_state.migration_summary = {}
+        st.session_state["migration_run_id"] = None
         _log("Job queue cleared", "warn")
         st.rerun()
 

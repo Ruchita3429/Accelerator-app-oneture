@@ -44,6 +44,7 @@ import pandas as pd
 import time
 import io
 import json
+import uuid
 from datetime import datetime
 from pipeline_routes import resolve_route, s3_only, reset_queue
 from aws_credentials import boto3_credentials, redshift_copy_credentials
@@ -52,8 +53,10 @@ from aws_credentials import boto3_credentials, redshift_copy_credentials
 import importlib
 import chunk_01_table_discovery
 import chunk_02_job_queue_engine
+import chunk_03_monitoring_ui
 importlib.reload(chunk_01_table_discovery)
 importlib.reload(chunk_02_job_queue_engine)
+importlib.reload(chunk_03_monitoring_ui)
 from chunk_01_table_discovery import render_table_discovery, get_job_queue_summary
 from chunk_02_job_queue_engine import render_execution_controls, run_migration, record_manual_transfer
 from chunk_03_monitoring_ui   import render_monitoring_tab
@@ -140,6 +143,10 @@ def init_state():
         "migration_done": False,
         "checkpoint": {},
         "migration_summary": {},
+        "migration_run_id": None,
+        "metrics_error": None,
+        "metrics_backup_error": None,
+        "metrics_backup_status": None,
         # Validation tab
         # val2_ keys are managed by tab_data_validation.py _init()
         "val2_stage": "idle",
@@ -1386,9 +1393,11 @@ with tab1, tab_loading():
                 add_log(f"Starting export · {len(sf_tables_selected)} table(s) → S3 ({_source_type})", "info")
                 progress = st.progress(0, text="Preparing export…")
                 all_ok = True
+                _manual_metrics_run_id = uuid.uuid4().hex
 
                 for i, tbl in enumerate(sf_tables_selected):
                     _export_started = time.monotonic()
+                    _export_started_at = datetime.now().astimezone().isoformat()
                     progress.progress((i) / len(sf_tables_selected), text=f"Exporting {tbl}…")
                     try:
                         import boto3, io
@@ -1483,7 +1492,12 @@ with tab1, tab_loading():
                             record_manual_transfer("export", source_schema=sf_schema, source_table=tbl,
                                                    s3_key=s3_key, rows=_result["rows"], bytes=_result["bytes"],
                                                    file_format=file_format, s3_bucket=_s3_cfg["bucket"],
-                                                   duration_secs=round(time.monotonic() - _export_started, 2))
+                                                   duration_secs=round(time.monotonic() - _export_started, 2),
+                                                   metrics_run_id=_manual_metrics_run_id,
+                                                   metrics_source=_source_type, metrics_target="S3",
+                                                   metrics_started_at=_export_started_at,
+                                                   metrics_secrets=chunk_02_job_engine._metrics_secrets(
+                                                       _sf_cfg, _db_cfg, _s3_cfg))
                             continue  # skip the put_object path below
                         elif file_format == "Parquet":
                             import pyarrow as pa
@@ -1528,17 +1542,38 @@ with tab1, tab_loading():
                                                s3_key=s3_key, rows=len(rows), bytes=len(body), file_format=file_format,
                                                s3_bucket=_s3_cfg["bucket"], delimiter=",", include_header=True,
                                                compression=compress and file_format in ("Parquet", "JSON"),
-                                               duration_secs=round(time.monotonic() - _export_started, 2))
+                                               duration_secs=round(time.monotonic() - _export_started, 2),
+                                               metrics_run_id=_manual_metrics_run_id,
+                                               metrics_source=_source_type, metrics_target="S3",
+                                               metrics_started_at=_export_started_at,
+                                               metrics_secrets=chunk_02_job_engine._metrics_secrets(
+                                                   _sf_cfg, _db_cfg, _s3_cfg))
 
                         add_log(f"✓ {tbl} → s3://{_s3_cfg['bucket']}/{s3_key} ({len(rows):,} rows)", "ok")
 
                     except Exception as exc:
-                        record_manual_transfer("export", source_schema=sf_schema, source_table=tbl, error=str(exc))
+                        record_manual_transfer(
+                            "export", source_schema=sf_schema, source_table=tbl, error=str(exc),
+                            duration_secs=round(time.monotonic() - _export_started, 2),
+                            metrics_run_id=_manual_metrics_run_id,
+                            metrics_source=_source_type, metrics_target="S3",
+                            metrics_started_at=_export_started_at,
+                            metrics_secrets=chunk_02_job_engine._metrics_secrets(
+                                _sf_cfg, _db_cfg, _s3_cfg),
+                        )
                         add_log(f"✗ {tbl}: {exc}", "err")
                         st.error(f"Export failed for {tbl}: {exc}")
                         all_ok = False
 
                 progress.progress(1.0, text="Done!")
+                chunk_02_job_engine.finalize_metrics_run(
+                    _manual_metrics_run_id,
+                    _source_type,
+                    "S3",
+                    "completed" if all_ok else "partial",
+                    _s3_cfg,
+                    None if all_ok else "One or more manual exports failed.",
+                )
                 if all_ok:
                     st.success(f"✅ {len(sf_tables_selected)} table(s) exported to S3 successfully.")
                 else:
@@ -1930,6 +1965,7 @@ with tab2, tab_loading():
 
                 skipped, succeeded, failed = [], [], []
                 progress_bar = st.progress(0, text="Starting…")
+                _manual_load_run_id = chunk_02_job_engine.metrics_run_id_for_transfer()
 
                 for idx, (s3_key, _sz, file_fmt) in enumerate(t2_selected_entries):
                     fname = s3_key.split("/")[-1]
@@ -1956,8 +1992,9 @@ with tab2, tab_loading():
                                 continue
 
                     # ── COPY ──────────────────────────────────────────────────────
+                    _load_started = time.monotonic()
+                    _load_started_at = datetime.now().astimezone().isoformat()
                     try:
-                        _load_started = time.monotonic()
                         _do_redshift_copy(
                             _rscfg_load, _s3cfg_load, s3_key,
                             t2_rs_schema, t2_rs_table, file_fmt, t2_load_mode,
@@ -1973,11 +2010,28 @@ with tab2, tab_loading():
                         record_manual_transfer("load", s3_key=s3_key,
                                                rs_schema=t2_rs_schema, rs_table=t2_rs_table,
                                                s3_bucket=_s3cfg_load["bucket"],
-                                               rs_duration_secs=round(time.monotonic() - _load_started, 2))
+                                               bytes=_sz,
+                                               rs_duration_secs=round(time.monotonic() - _load_started, 2),
+                                               metrics_run_id=_manual_load_run_id,
+                                               metrics_source="S3",
+                                               metrics_target=f"{t2_rs_schema}.{t2_rs_table}",
+                                               metrics_started_at=_load_started_at,
+                                               metrics_secrets=chunk_02_job_engine._metrics_secrets(
+                                                   _rscfg_load, _s3cfg_load))
                         succeeded.append(fname)
                         add_log(f"✓ {fname} → {t2_rs_schema}.{t2_rs_table}", "ok")
                     except Exception as copy_err:
-                        record_manual_transfer("load", s3_key=s3_key, s3_bucket=_s3cfg_load["bucket"], error=str(copy_err))
+                        record_manual_transfer(
+                            "load", s3_key=s3_key, s3_bucket=_s3cfg_load["bucket"],
+                            error=str(copy_err), bytes=_sz,
+                            rs_duration_secs=round(time.monotonic() - _load_started, 2),
+                            metrics_run_id=_manual_load_run_id,
+                            metrics_source="S3",
+                            metrics_target=f"{t2_rs_schema}.{t2_rs_table}",
+                            metrics_started_at=_load_started_at,
+                            metrics_secrets=chunk_02_job_engine._metrics_secrets(
+                                _rscfg_load, _s3cfg_load),
+                        )
                         failed.append((fname, str(copy_err)))
                         add_log(f"✗ COPY failed {fname}: {copy_err}", "err")
                         break
@@ -1986,6 +2040,14 @@ with tab2, tab_loading():
                 pending = len(t2_selected_entries) - processed
                 progress_bar.progress(processed / len(t2_selected_entries),
                                       text=f"Stopped after load failure · {pending} pending" if failed else "Finished")
+                chunk_02_job_engine.finalize_metrics_run(
+                    _manual_load_run_id,
+                    "S3",
+                    f"{t2_rs_schema}.{t2_rs_table}",
+                    "completed" if len(succeeded) == len(t2_selected_entries) else "partial",
+                    _s3cfg_load,
+                    "; ".join(reason for _, reason in failed) or None,
+                )
 
                 # ── Results summary ───────────────────────────────────────────────
                 st.markdown("---")
@@ -2012,7 +2074,7 @@ with tab2, tab_loading():
     # TAB 3 · Monitor  (Chunk 3)
     # ─────────────────────────────────────────────────────────────────────────────
 with tab_monitor, tab_loading():
-    render_monitoring_tab()
+    render_monitoring_tab(_s3_cfg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

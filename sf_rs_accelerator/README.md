@@ -146,6 +146,7 @@ sf_rs_accelerator/
 ├── chunk_02_job_queue_engine.py        # Migration execution engine, S3 unload, Redshift COPY
 ├── chunk_03_monitoring_ui.py           # Real-time monitoring status grid
 ├── chunk_04_metrics_report.py          # Migration throughput metrics & COPY generator
+├── metrics_repository.py               # Serialized DuckDB run history and S3 snapshots
 ├── tab_data_validation.py              # Cross-cloud data validation suite
 ├── iceberg_s3_writer.py                # Apache Iceberg v2 writer & AWS Glue catalog sync
 ├── st_to_rs_bi_query_migration.py      # Core SQLGlot query & stored procedure translator
@@ -190,6 +191,8 @@ python -m pip install -r requirements.txt
 python -m streamlit run app_final.py
 ```
 *The app will automatically open in your browser at `http://localhost:8501`.*
+
+For durable run history, persistent-volume requirements, writer-process constraints, and S3 metric snapshot permissions, see [DUCKDB_METRICS.md](DUCKDB_METRICS.md).
 
 ---
 

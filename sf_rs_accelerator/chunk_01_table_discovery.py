@@ -5,6 +5,7 @@ import mmh3_compat  # Pure-Python mmh3 fallback if C-extension is blocked by WDA
 import streamlit as st
 import time
 from datetime import datetime
+from pipeline_routes import reset_queue
 
 
 # ── Demo data (fallback when connectors aren't installed / creds absent) ──────
@@ -520,6 +521,7 @@ def render_table_discovery(
             "rs_schema":      resolved_schema,
         }
         queue = _build_job_queue(selected_tables, bulk_defaults, s3_prefix, source_type=source_name)
+        reset_queue(st.session_state)
         st.session_state.job_queue = queue
 
         ts = datetime.now().strftime("%H:%M:%S")

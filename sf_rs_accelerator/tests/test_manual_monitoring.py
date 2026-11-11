@@ -24,6 +24,14 @@ def export(job, **kwargs):
 
 
 class ManualMonitoring(unittest.TestCase):
+    def setUp(self):
+        repository = patch.object(engine, "_metrics_call", return_value="test-attempt")
+        finalize = patch.object(engine, "_metrics_finish_run")
+        repository.start()
+        finalize.start()
+        self.addCleanup(repository.stop)
+        self.addCleanup(finalize.stop)
+
     def test_nine_s3_only_exports_complete_the_monitor_queue(self):
         state = state_for("Source → S3 only")
         with patch.object(engine, "st", Mock(session_state=state)):

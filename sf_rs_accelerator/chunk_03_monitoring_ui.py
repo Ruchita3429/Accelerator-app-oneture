@@ -208,8 +208,95 @@ def _render_live_notice():
     )
 
 
+def _render_durable_history(s3_cfg=None):
+    if st.session_state.get("metrics_error"):
+        st.warning(st.session_state["metrics_error"])
+    if st.session_state.get("metrics_backup_error"):
+        st.warning(st.session_state["metrics_backup_error"])
+    elif st.session_state.get("metrics_backup_status"):
+        st.caption(f"Latest metrics snapshot: {st.session_state['metrics_backup_status']}")
+
+    with st.expander("🗃 Durable Run History", expanded=False):
+        try:
+            from metrics_repository import get_metrics_repository
+            repository = get_metrics_repository()
+            runs = repository.recent_runs()
+        except Exception as exc:
+            st.error(f"Could not read durable DuckDB metrics: {exc}")
+            return
+        if not runs:
+            st.info("No durable migration runs have been recorded yet.")
+            return
+        st.dataframe(
+            [{
+                "Run ID": run["run_id"],
+                "Source": run["source"],
+                "Target": run["target"],
+                "Started": run["start_time"],
+                "Duration (s)": run["duration_seconds"],
+                "Status": run["status"],
+                "Stage": run["current_stage"],
+                "Rows read": run["rows_read"],
+                "Rows written": run["rows_written"],
+                "Rows rejected": run["rows_rejected"],
+                "Bytes": run["bytes_processed"],
+                "Validation": run["validation_result"],
+                "Error": run["error_details"],
+            } for run in runs],
+            use_container_width=True,
+            hide_index=True,
+        )
+        run_ids = [run["run_id"] for run in runs]
+        failed_backup_run = st.session_state.get("metrics_backup_run_id")
+        selected_run = st.selectbox(
+            "Run details",
+            run_ids,
+            format_func=lambda value: next(
+                f"{run['start_time']} · {run['source']} → {run['target']} · {run['status']}"
+                for run in runs if run["run_id"] == value
+            ),
+            index=run_ids.index(failed_backup_run) if failed_backup_run in run_ids else 0,
+            key="durable_metrics_run",
+        )
+        if (s3_cfg or {}).get("bucket") and st.button(
+            "Retry metrics snapshot upload" if selected_run == failed_backup_run
+            else "Export selected run snapshot to S3",
+            key="retry_metrics_snapshot",
+        ):
+            from chunk_02_job_queue_engine import retry_metrics_snapshot
+            if retry_metrics_snapshot(selected_run, s3_cfg):
+                st.success("Metrics snapshot uploaded.")
+            else:
+                st.warning(st.session_state.get("metrics_backup_error", "Snapshot upload failed."))
+        try:
+            attempts = repository.attempts_for_run(selected_run)
+        except Exception as exc:
+            st.error(f"Could not read metrics for this run: {exc}")
+        else:
+            if attempts:
+                st.dataframe(
+                    [{
+                        "Job": attempt["job_id"],
+                        "Operation": attempt["operation"],
+                        "Started": attempt["start_time"],
+                        "Duration (s)": attempt["duration_seconds"],
+                        "Status": attempt["status"],
+                        "Stage": attempt["current_stage"],
+                        "Rows read": attempt["rows_read"],
+                        "Rows written": attempt["rows_written"],
+                        "Rows rejected": attempt["rows_rejected"],
+                        "Bytes": attempt["bytes_processed"],
+                        "Watermark": attempt["watermark"],
+                        "Validation": attempt["validation_result"],
+                        "Error": attempt["error_details"],
+                    } for attempt in attempts],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+
 # ── Main render entry point ───────────────────────────────────────────────────
-def render_monitoring_tab():
+def render_monitoring_tab(s3_cfg=None):
     """
     Full monitoring tab renderer.
     Call this inside a `with tab:` block in the main script.
@@ -222,6 +309,7 @@ def render_monitoring_tab():
 
     if not queue:
         st.info("No migration queued yet. Complete Table Discovery first.")
+        _render_durable_history(s3_cfg)
         return
 
     if running:
@@ -280,3 +368,4 @@ def render_monitoring_tab():
             ),
         },
     )
+    _render_durable_history(s3_cfg)

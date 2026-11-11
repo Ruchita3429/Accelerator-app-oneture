@@ -46,4 +46,5 @@ def source_schema(job):
 
 def reset_queue(state):
     state.update(job_queue=[], checkpoint={}, migration_done=False,
-                 migration_running=False, migration_summary={})
+                 migration_running=False, migration_summary={},
+                 migration_run_id=None)

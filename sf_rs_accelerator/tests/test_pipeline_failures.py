@@ -60,6 +60,16 @@ class DataAPI:
 
 
 class PipelineFailures(unittest.TestCase):
+    def setUp(self):
+        # Pipeline tests use placeholder AWS credentials. Snapshot behavior is
+        # covered separately with a mocked S3 client in test_duckdb_metrics.
+        metrics = patch.object(engine, "_metrics_call", return_value="test-attempt")
+        patcher = patch.object(engine, "_metrics_finish_run")
+        metrics.start()
+        patcher.start()
+        self.addCleanup(metrics.stop)
+        self.addCleanup(patcher.stop)
+
     def test_bigquery_panels_build_queue_and_destination_change_clears_it(self):
         from pathlib import Path
         from streamlit.testing.v1 import AppTest
