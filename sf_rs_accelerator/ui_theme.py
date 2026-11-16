@@ -21,15 +21,25 @@ def brand_image(name):
     assets = {"iceberg": ("iceberg.svg", "image/svg+xml"),
               "bigquery": ("bigquery.svg", "image/svg+xml"),
               "s3": ("s3.jpg", "image/jpeg"),
-              "redshift": ("redshift.png", "image/png")}
+              "redshift": ("redshift.png", "image/png"),
+              "sap": ("sap.webp", "image/webp")}
     if name not in assets:
         return None
     filename, mime = assets[name]
     data = (Path(__file__).parent / "assets" / "brands" / filename).read_bytes()
     encoded = base64.b64encode(data).decode("ascii")
-    return (f'<img class="brand-icon brand-icon-{name}" width="18" height="18" '
-            f'alt="" aria-hidden="true" style="object-fit:contain;max-width:28px;max-height:28px" '
-            f'src="data:{mime};base64,{encoded}">')
+    width = 56 if name == "sap" else 18
+    height = 56 if name == "sap" else 18
+    max_size = 56 if name == "sap" else 28
+
+    return (
+        f'<img class="brand-icon brand-icon-{name}" '
+        f'width="{width}" height="{height}" '
+        f'alt="" aria-hidden="true" '
+        f'style="object-fit:contain;'
+        f'max-width:{max_size}px;max-height:{max_size}px" '
+        f'src="data:{mime};base64,{encoded}">'
+    )
 
 
 @contextmanager

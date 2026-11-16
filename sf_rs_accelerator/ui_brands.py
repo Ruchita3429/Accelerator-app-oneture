@@ -8,6 +8,7 @@ _BRAND_MARKS = {
     "bigquery": '<path d="M4 3h5v18H4zM10 3h5v18h-5zM16 3h4v18h-4z"/>',
     "s3": '<path d="M4 7h16l-1.2 13H5.2L4 7Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M7 4c3-2 7-2 10 0M8 13c2 1 6 1 8 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="m15 11 2 2-2 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>',
     "redshift": '<ellipse cx="12" cy="5" rx="8" ry="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 5v13c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11c0 1.7 3.6 3 8 3s8-1.3 8-3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 8h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+    "sap": '<path d="M4 6h16v12H4z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M7 9h10M7 12h7M7 15h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
 }
 
 
