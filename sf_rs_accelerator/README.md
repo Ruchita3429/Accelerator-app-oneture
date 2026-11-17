@@ -53,7 +53,7 @@ This **Migration Accelerator** solves these challenges by providing a single, un
 │  ❄️ Snowflake   🟠 Databricks   │
 └──────────────┬──────────────────┘
                │
-               ▼  (UNLOAD / PyArrow / PyIceberg)
+               ▼  (Python read + PyArrow / Snowflake UNLOAD if partitioned)
 ┌─────────────────────────────────────────────────────────────┐
 │                    Intermediate Staging                     │
 │                       Amazon S3                             │
@@ -86,7 +86,7 @@ This **Migration Accelerator** solves these challenges by providing a single, un
 ### 2. Multi-Format S3 Staging (CSV, Parquet, Iceberg)
 - **CSV & Parquet**: Automated compression (Gzip/Snappy) and partitioned file generation.
 - **Apache Iceberg (`iceberg_s3_writer.py`)**:
-  - Native Apache Iceberg metadata creation via `pyiceberg`.
+  - Iceberg v2 metadata and Parquet data files written directly by the accelerator (no `pyiceberg` catalog calls on the write path).
   - Automatic table and partition registration in **AWS Glue Data Catalog**.
   - Direct queryability via **Amazon Redshift Spectrum** (`SELECT * FROM "awsdatacatalog"."table"`).
 - **High-Capacity Unload**:
@@ -119,6 +119,7 @@ Located in **Tab 6 (`tab_data_validation.py`)**:
   - **Paste & Convert**: Transforms Snowflake/Databricks `CREATE TABLE` to Redshift syntax.
   - **Bulk Schema Converter**: Converts an entire source database or schema into an executable `.sql` script.
   - **Key Optimization**: Automatically analyzes and recommends `DISTKEY` and `SORTKEY` configurations.
+  - **Run on Redshift**: after converting, connect Redshift, tick the confirmation box, and click **▶ Run on Redshift** to create the tables (`ddl_executor.py`). Only `CREATE TABLE` / `CREATE SCHEMA` run; anything else in the script blocks the whole run. Existing tables are skipped, never dropped or replaced, and missing non-`public` schemas are created.
 - **Query & Procedure Migrator (Tab 8 & `query_migrator_app_v2.py`)**:
   - Powered by `sqlglot` for Snowflake $\rightarrow$ Redshift translation.
   - Automatically translates functions: `STRING_AGG` $\rightarrow$ `LISTAGG`, `NVL` $\rightarrow$ `COALESCE`, `DATEADD`, `DATEDIFF`, and window functions.
@@ -240,7 +241,8 @@ Choose **❄️ Snowflake** or **🟠 Databricks** at the top of the sidebar.
 2. **Execute Migration (Tab 2 / Tab 3)**:
    - Click **▶ Start Migration**.
    - Watch live extraction to S3 and automated loading into Redshift.
-   - If an individual table encounters an issue, review the diagnostic card and click **Resume** to retry.
+   - If one table hits a table-specific problem (wrong column type, value too long, row-count mismatch, no permission on that table), it is **skipped** and the rest of the queue keeps running. If the problem is systemic (expired credentials, no permission on the schema, external schema), the run **stops** so it does not fail every table.
+   - Review the diagnostic card (short summary, full text in "Full error detail"), fix the cause, then click **Resume** to retry only the failed tables. After changing settings or fixing a target table, use **Reset & Start Over** or **Clear Queue** instead, so the export and column types are rebuilt.
 3. **Monitor & Review (Tab 4 & Tab 5)**:
    - Monitor aggregate throughput (MB/s) and download generated `COPY` commands.
 4. **Validate Data (Tab 6)**:
@@ -265,6 +267,26 @@ Choose **❄️ Snowflake** or **🟠 Databricks** at the top of the sidebar.
 **A**: Redshift `COPY` cannot write directly to AWS Glue external schemas.
 - **Solution 1**: Select a local schema such as `public` as the destination.
 - **Solution 2**: Choose **Apache Iceberg** format. The accelerator will register the Iceberg table directly in AWS Glue, making it immediately queryable via Redshift Spectrum (`SELECT * FROM "awsdatacatalog"."table"`) without needing a `COPY` step.
+
+#### Q: `permission denied for schema public` or `permission denied for relation <table>`?
+**A**: Redshift Data API maps your AWS identity to a database user (`IAM:<user>` or `IAMR:<role>`). A Redshift admin must grant it access, using the exact name from `SELECT current_user;`:
+```sql
+GRANT USAGE, CREATE ON SCHEMA public TO "IAMR:<your-role>";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "IAMR:<your-role>";
+```
+`TRUNCATE & LOAD` also needs table ownership. A schema-level denial stops the run; a single-table denial skips just that table.
+
+#### Q: `COMPUPDATE argument is not supported for PARQUET based COPY`, or `Unmatched number of columns` / `incompatible Parquet schema` / `Error fetching values of DATE column`?
+**A**: Fixed in the current engine: Parquet, ORC and Iceberg loads omit `COMPUPDATE`, and tables are auto-created from the exported file's real column types. If a table was created by an older version and is empty, the engine rebuilds it on retry. If it holds data or belongs to another user, drop or alter it, then use **Reset & Start Over**.
+
+#### Q: `Target row-count mismatch: expected 100 loaded rows, found 400`?
+**A**: The target table already contained rows from an earlier attempt. Use **TRUNCATE & LOAD**, or empty the table, then click **Resume**. Iceberg loads read only the current run's data file, so repeated runs no longer add rows by themselves.
+
+#### Q: `Iceberg export requires valid S3 bucket, access_key, and secret_key`?
+**A**: The S3 fields in the sidebar are empty. Streamlit clears them on a browser refresh or restart, and temporary SSO keys (`ASIA...`) expire after a few hours. Paste fresh keys, including the **Session Token**, reconnect, and use **Clear Queue** before rebuilding.
+
+#### Q: `TIMESTAMP_LTZ and LTZ types are not supported for unloading to Parquet`?
+**A**: This is a Snowflake limit on its server-side unload. Non-partitioned Snowflake exports are now read in Python and do not hit it. It can still occur for tables exported with partitioning turned on.
 
 #### Q: Application Control / WDAC policy blocks DLL import for `mmh3`?
 **A**: The accelerator includes `mmh3_compat.py`, a pure-Python 128-bit MurmurHash3 implementation that automatically kicks in if the native C-extension is blocked by enterprise security policies.

@@ -2398,6 +2398,116 @@ def _render_log_box(log_lines):
     return html
 
 
+def _render_redshift_executor(sql: str, key: str):
+    """'Run on Redshift' panel for converted DDL.
+
+    Runs only CREATE TABLE / CREATE SCHEMA (see ddl_executor), never replaces an
+    existing table, and needs an explicit confirmation before anything executes.
+    """
+    import hashlib
+    import ddl_executor
+
+    st.markdown("---")
+    st.markdown('<div class="card-title">🚀 Run on Redshift</div>', unsafe_allow_html=True)
+
+    if not st.session_state.get("rs_connected"):
+        st.markdown('<span class="badge badge-disconnected">○ Connect Redshift in the sidebar to run this DDL</span>',
+                    unsafe_allow_html=True)
+        return
+
+    # The converter writes `DROP TABLE IF EXISTS x; CREATE TABLE x` for every
+    # Snowflake "CREATE OR REPLACE". By default the DROP is removed so existing
+    # tables stay safe; replacing them is an explicit, typed opt-in.
+    has_replace = ddl_executor.prepare(sql, allow_replace=True)["replace"]
+    allow_replace = False
+    if has_replace:
+        allow_replace = st.checkbox(
+            f"Replace tables that already exist ({len(has_replace)} found in this DDL)",
+            key=f"{key}_exec_replace",
+            help="Drops each existing table and recreates it. The data in those tables is deleted.",
+        )
+        if allow_replace:
+            st.warning("Existing tables will be DROPPED and recreated empty. Their data is lost, "
+                       "and this is not atomic: if a CREATE fails after its DROP, the old table is gone.")
+            typed = st.text_input("Type REPLACE to enable replacing", key=f"{key}_exec_replace_word")
+            allow_replace = typed.strip() == "REPLACE"
+            if not allow_replace:
+                st.caption("Replace mode stays off until you type REPLACE.")
+
+    plan = ddl_executor.prepare(sql, allow_replace=allow_replace)
+    statements = plan["statements"]
+    if not statements:
+        st.info("There are no statements to run.")
+        return
+    if plan["blocked"]:
+        st.error("This DDL contains statements that cannot be run from here, so nothing will execute. "
+                 "Only CREATE TABLE and CREATE SCHEMA are allowed.")
+        for label, reason in plan["blocked"]:
+            st.write(f"• `{label}`: {reason}")
+        return
+
+    tables = [ddl_executor.statement_label(s) for s in statements]
+    schemas = ddl_executor.schemas_referenced(statements)
+    target = f"{_rs_cfg.get('workgroup') or '?'} / {_rs_cfg.get('database') or '?'}"
+    st.caption(f"Target Redshift: **{target}** · {len(statements)} statement(s). "
+               + ("Tables listed as DROP below will be replaced." if allow_replace else
+                  "Existing tables are left unchanged, never dropped or replaced."))
+    if plan["drops_removed"]:
+        st.caption(f"{plan['drops_removed']} `DROP TABLE IF EXISTS` line(s) from the converter were removed "
+                   "to protect existing tables.")
+    with st.expander(f"Statements to run ({len(statements)})"):
+        for label in tables:
+            st.write(f"• `{label}`")
+        if schemas:
+            st.write("Schemas created if missing: " + ", ".join(f"`{s}`" for s in schemas))
+
+    continue_on_error = st.checkbox("Keep going if a statement fails", value=len(statements) > 1,
+                                    key=f"{key}_exec_continue")
+    confirmed = st.checkbox(f"I confirm creating these objects in Redshift database `{_rs_cfg.get('database')}`",
+                            key=f"{key}_exec_confirm")
+    run_clicked = st.button("▶ Run on Redshift", key=f"{key}_exec_run", disabled=not confirmed)
+
+    state_key = f"{key}_exec_result"
+    signature = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+    if run_clicked:
+        with st.spinner(f"Running {len(statements)} statement(s) on Redshift…"):
+            try:
+                results = ddl_executor.run(
+                    statements,
+                    lambda stmt: _rs_run_sql(_rs_cfg, stmt, timeout=120),
+                    create_schemas=schemas,
+                    continue_on_error=continue_on_error,
+                    allow_replace=allow_replace,
+                )
+            except ValueError as exc:
+                results = [{"statement": "(setup)", "status": "failed", "message": str(exc)}]
+        st.session_state[state_key] = {"sig": signature, "results": results}
+        counts = ddl_executor.summarize(results)
+        add_log(f"DDL run on Redshift: {counts['created']} created, {counts['skipped']} existed, "
+                f"{counts['failed']} failed", "ok" if not counts["failed"] else "warn")
+
+    saved = st.session_state.get(state_key)
+    if not saved or saved.get("sig") != signature:
+        return
+    results = saved["results"]
+    counts = ddl_executor.summarize(results)
+    summary = (f"{counts['created']} created · "
+               + (f"{counts['dropped']} replaced · " if counts["dropped"] else "")
+               + f"{counts['skipped']} already existed · "
+               f"{counts['failed']} failed · {counts['not run']} not run")
+    (st.success if not counts["failed"] else st.warning)(summary)
+    icons = {"created": "✅", "dropped": "🗑", "skipped": "⏭", "failed": "❌", "not run": "⏸"}
+    st.dataframe(
+        pd.DataFrame([{"": icons.get(r["status"], ""), "Statement": r["statement"],
+                       "Result": r["status"], "Detail": r["message"]} for r in results]),
+        use_container_width=True, hide_index=True,
+    )
+    if any("permission denied" in r["message"].lower() for r in results):
+        st.info("💡 The Redshift user for your AWS identity cannot create objects here. A Redshift admin must run "
+                "`GRANT USAGE, CREATE ON SCHEMA <schema> TO \"IAMR:<your-role>\";` "
+                "(use the name from `SELECT current_user;`), then run again.")
+
+
 with tab_ddl, tab_loading():
     _ddl_src_label = "BigQuery" if _source_type == "BigQuery" else "Databricks" if _source_type == "Databricks" else "Snowflake"
     st.markdown(f'<div class="card-title">🏗 {_ddl_src_label} → Redshift DDL Converter</div>',
@@ -2416,6 +2526,9 @@ with tab_ddl, tab_loading():
     # BIGQUERY path — delegate entirely to the dedicated BQ DDL UI module
     # ══════════════════════════════════════════════════════════════════════════
     if _source_type == "BigQuery":
+        if _BQ_AVAILABLE:
+            import bigquery_ddl_ui as _bq_ddl_module
+            _bq_ddl_module.RESULT_ACTION = _render_redshift_executor  # adds "Run on Redshift"
         with ddl_sub_paste, tab_loading():
             if not _BQ_AVAILABLE:
                 st.error(f"BigQuery DDL migrator unavailable: {_bq_err_msg}")
@@ -2614,6 +2727,7 @@ CLUSTER BY (ORDER_DATE);"""
                     if st.session_state.ddl_sortkey else
                     '<span class="badge badge-pending">◌ SORTKEY AUTO</span>')
                 st.markdown("&nbsp;&nbsp;".join(_parts), unsafe_allow_html=True)
+            _render_redshift_executor(st.session_state.ddl_output, "ddl_paste")
 
         # ══════════════════════════════════════════════════════════════════════
         # SUB-TAB B · Bulk Convert from source
@@ -2948,6 +3062,10 @@ CLUSTER BY (ORDER_DATE);"""
                                 f'</span>',
                                 unsafe_allow_html=True,
                             )
+
+                    if _ok_res:
+                        _render_redshift_executor(
+                            "\n".join(r["sql"].strip().rstrip(";") + ";" for r in _ok_res), "ddl_bulk")
 
                     st.markdown("---")
 

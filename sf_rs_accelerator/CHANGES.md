@@ -23,6 +23,7 @@
 11. [What Was NOT Changed — chunk_04_metrics_report.py](#11-what-was-not-changed--chunk_04_metrics_reportpy)
 12. [One Remaining Gap to Be Aware Of](#12-one-remaining-gap-to-be-aware-of)
 13. [File-by-File Summary](#13-file-by-file-summary)
+14. [Change 9 — Reliable Loads: Failure Handling and Correct Column Types](#14-change-9--reliable-loads-failure-handling-and-correct-column-types-november-2026)
 
 ---
 
@@ -276,8 +277,9 @@ same reason as `mmh3`: unsigned binaries in user-writable directories.
 ### What was done:
 
 For Iceberg exports, the code now uses the new `iceberg_s3_writer.py` (see Change 6),
-which uses `fastparquet` instead of `pyarrow`. `fastparquet` is allowed by Windows
-policies.
+which writes Parquet through `pyarrow.parquet` and builds the Iceberg metadata by hand,
+so it never needs the blocked `pyarrow._dataset` module. (An earlier version used
+`fastparquet`; the current code does not.)
 
 If the Iceberg write ever fails for any reason, data is staged to S3 as a structured
 CSV file as a safety net, with a clear warning logged. The pipeline continues
@@ -322,7 +324,7 @@ s3://your-bucket/prefix/schema/table/
 | Step | What happens |
 |---|---|
 | 1 | Receives the data as a Pandas DataFrame (a table in memory) |
-| 2 | Writes it to Parquet using `fastparquet` with Snappy compression — WDAC-safe |
+| 2 | Converts it to an Arrow table (real column types) and writes Parquet with Snappy compression through `pyarrow.parquet` |
 | 3 | Builds the Iceberg v2 `metadata.json` — records column names, types, row counts, snapshot ID |
 | 4 | Uploads all 3 files to S3 via `boto3` |
 | 5 | Registers the table in **AWS Glue Data Catalog** as an `EXTERNAL_TABLE` of type `ICEBERG` |
@@ -524,11 +526,61 @@ is fully self-describing and unambiguous.
 | `chunk_01_table_discovery.py` | **Modified** | Added Databricks scanner, demo fallback data, `source_type` parameter, new job queue fields (`source_schema`, `source_table`, `db_schema`, `db_table`) |
 | `chunk_02_job_queue_engine.py` | **Modified** | Added Databricks extractors, Iceberg routing, external schema detection, auto-create table, TRUNCATE fix, Iceberg COPY path fix, S3-only detection fix |
 | `app_final.py` | **Modified** | Added `importlib.reload()`, restored CSV format, removed forced-Iceberg override, fixed schema discovery (4-layer strategy), updated Iceberg COPY path handling |
-| `iceberg_s3_writer.py` | **NEW** | Real Apache Iceberg v2 writer: `fastparquet` Parquet files + Iceberg metadata JSON + AWS Glue registration. Zero blocked DLL dependencies. |
+| `iceberg_s3_writer.py` | **NEW** | Real Apache Iceberg v2 writer: `pyarrow` Parquet files + hand-built Iceberg metadata JSON + AWS Glue registration. Does not need the blocked `pyarrow._dataset` module. |
 | `mmh3_compat.py` | **NEW** | Pure-Python MurmurHash3 shim that bypasses Windows WDAC/AppLocker security blocks on the `mmh3` C-extension |
 | `chunk_04_metrics_report.py` | **Not changed** | Works transparently for both Snowflake and Databricks jobs |
 | `chunk_03_monitoring_ui.py` | **Not changed** | Generic monitoring UI, source-agnostic |
 
 ---
 
-*Document generated: 14 September 2026*
+## 14. Change 9 — Reliable Loads: Failure Handling and Correct Column Types (November 2026)
+
+### Files changed:
+- `chunk_02_job_queue_engine.py`
+- `tests/test_pipeline_failures.py`
+
+### The problems found during live runs, and the fix for each
+
+| Symptom | Real cause | Fix |
+|---|---|---|
+| `COMPUPDATE argument is not supported for PARQUET based COPY` | Every COPY ended with `COMPUPDATE ON` | Parquet, ORC and Iceberg loads now send `STATUPDATE ON` only. CSV and JSON are unchanged. |
+| `Target row-count mismatch: expected 100, found 400` | Each Iceberg run adds a new `<uuid>-00000.parquet` to `data/` and COPY read the whole folder, so earlier attempts were loaded again | The job remembers the exact data file (`iceberg_data_key`) and COPY loads only that file |
+| `Error fetching values of DATE column` (code 1205) | Auto-created tables guessed types from pandas dtype names. Pandas 3 names timestamps `datetime64[us]`, which matched the text `date` and became `DATE` | Types now come from the Arrow schema of the exported file, so tables always match the data |
+| `Spectrum Scan Error 15007 ... incompatible Parquet schema` | Decimals became `VARCHAR` in the guessed table | Same fix: `DECIMAL(p,s)`, `DATE`, `TIMESTAMP`, `TIMESTAMPTZ`, `BIGINT` and so on, taken from the file |
+| `TIMESTAMP_LTZ and LTZ types are not supported for unloading to Parquet` | Snowflake cannot write that type to Parquet when it unloads server-side | Snowflake exports are now read in Python and written with PyArrow |
+| `FORMAT AS JSON` fails | Redshift requires a JSON argument, and key matching is case-sensitive | JSON loads use `FORMAT AS JSON 'auto ignorecase'` |
+
+### Stop on a systemic error, skip a one-table error
+
+Each failure is classified as one of two kinds, and the kind is stored on the job as `fail_kind`:
+
+- **fatal** (stops the run): expired or invalid credentials, permission denied on a *schema*, external Spectrum schema, connection or workgroup problems. The same cause would fail every remaining table, so the run stops and saves time and cost.
+- **table** (skip and continue): row-count mismatch, value too long, wrong column type, missing target table, permission denied on a single *table*. The other tables still migrate.
+
+Anything the classifier does not recognise is treated as fatal, which keeps the original stop-on-failure behaviour for unknown errors. If 3 tables in one run fail with table-level permission errors, the run stops, because that points to a missing schema-wide GRANT.
+
+**Resume** is unchanged: it skips tables already marked done, reuses files already exported to S3, and retries the rest. After a run that skipped tables, "the rest" is just the failed tables.
+
+### Automatic repair of an empty table
+
+If a COPY fails because the target table's column types do not fit the file, the engine drops and recreates the table from the file's real types, then retries once. It does this only when the table is **empty** and **owned by the identity the app runs as**. A table that holds rows, or that belongs to another user, is never touched.
+
+### Snowflake exports now read in Python
+
+Parquet, CSV, JSON and ORC exports from Snowflake are read through the Python connector, like Iceberg exports. This records column types (enabling auto-create and the repair above), supports `TIMESTAMP_LTZ/TZ`, and makes Snowflake to ORC work. **Partitioned exports** still use Snowflake's server-side `COPY INTO`, which cannot write ORC.
+
+Limit: the Python path loads one table into memory at a time. For very large tables, use partitioning.
+
+### Clearer error screen
+
+Error cards show a short summary. The full Redshift text is in a "Full error detail" expander and in the operation log. Hints now cover permission, row-count, value-length and column-type errors.
+
+### Things to know
+
+- After changing code or fixing a target table, use **Reset & Start Over** (or **Clear Queue** and rebuild) rather than Resume. Resume reuses the previous export and the column types saved when the queue ran.
+- Snowflake CSV exports are not quote-enclosed. Text containing commas, quotes or line breaks makes the Redshift load fail loudly instead of loading wrong data.
+- Live-verified: Snowflake to Iceberg to Redshift. The Snowflake Python path for Parquet, CSV, JSON and ORC, and the Databricks paths, are covered by mocked tests but have not been run against live systems.
+
+---
+
+*Document generated: 14 September 2026 · Section 14 added: 6 November 2026*

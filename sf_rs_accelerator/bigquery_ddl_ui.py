@@ -24,6 +24,10 @@ CLUSTER BY customer_id, status
 OPTIONS(description='Sales order demo table');"""
 
 
+# Optional hook: callable(sql, key_prefix) set by app_final.py to run the DDL on Redshift.
+RESULT_ACTION = None
+
+
 def _migration_settings(prefix, allow_mappings=True):
     left, middle, right = st.columns(3)
     with left:
@@ -116,6 +120,11 @@ def _render_result(result, source, fingerprint, prefix, filename):
         "Download Redshift DDL", data=notes + "\n\n" + result["sql"] + "\n",
         file_name=filename, mime="text/plain", key=f"{prefix}_download",
     )
+    # The main app sets RESULT_ACTION to add a "Run on Redshift" panel. It is only
+    # called here, after the fingerprint and error checks above, so it can never
+    # offer DDL that is out of date with the input or settings.
+    if RESULT_ACTION is not None:
+        RESULT_ACTION(result["sql"], prefix)
 
 
 def _paste_tab():
