@@ -265,45 +265,140 @@ def render_logs():
     st.markdown(html, unsafe_allow_html=True)
 
 
+# ── SAP Glue metrics and report ───────────────────────────────────────────────
+def _duration_seconds(started_on, completed_on, execution_time=None):
+    """Return a run duration in seconds using Glue's timestamps when available."""
+    if execution_time not in (None, ""):
+        try:
+            return int(execution_time)
+        except (TypeError, ValueError):
+            pass
+    if started_on and completed_on:
+        try:
+            return max(0, int((completed_on - started_on).total_seconds()))
+        except Exception:
+            pass
+    return None
+
+
+def _render_sap_glue_metrics():
+    """Display the separate SAP Glue run without treating it as a queue job."""
+    status = st.session_state.get("sap_glue_job_status", "NOT_STARTED")
+    run_id = st.session_state.get("sap_glue_job_run_id")
+    run_config = st.session_state.get("sap_glue_run_config", {}) or {}
+    details = st.session_state.get("sap_glue_job_details", {}) or {}
+
+    has_sap_run = bool(run_id or status not in ("NOT_STARTED", ""))
+    if not has_sap_run:
+        return False
+
+    st.markdown('<div class="card-title">🧩 SAP Glue Migration Metrics</div>', unsafe_allow_html=True)
+    st.caption("SAP runs through AWS Glue independently of the generic table migration queue.")
+
+    started = details.get("started_on")
+    completed = details.get("completed_on")
+    duration = _duration_seconds(started, completed, details.get("execution_time"))
+    duration_label = f"{duration:,} sec" if duration is not None else "Not available yet"
+
+    # Keep SAP metric typography compact and consistent with the rest of the app.
+    st.markdown(
+        """
+        <style>
+        .st-key-sap_glue_metrics [data-testid="stMetricValue"] {
+            font-size: 1rem !important;
+            line-height: 1.25 !important;
+        }
+        .st-key-sap_glue_metrics [data-testid="stMetricLabel"] {
+            font-size: 0.75rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(key="sap_glue_metrics"):
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Glue Job Status", status.replace("_", " ").title())
+        col2.metric("Execution Time", duration_label)
+        col3.metric("Entity Set", run_config.get("entity_set") or st.session_state.get("sap_selected_entity") or "—")
+        col4.metric("Load Type", run_config.get("load_type", "—"))
+
+        col5, col6, col7, col8 = st.columns(4)
+        col5.metric("Glue DPU Seconds", details.get("dpu_seconds", "—"))
+        col6.metric("Worker Type", details.get("worker_type") or "—")
+        col7.metric("Number of Workers", details.get("number_of_workers", "—"))
+        col8.metric("Output Format", run_config.get("output_format", "—"))
+
+    st.write(f"**Glue Job:** `{st.session_state.get('sap_glue_job_name') or '—'}`")
+    st.write(f"**Run ID:** `{run_id or '—'}`")
+    st.write(f"**S3 Destination:** `{run_config.get('s3_base_path') or '—'}`")
+    st.write(f"**Started:** {started or 'Not available'}")
+    st.write(f"**Completed:** {completed or 'Not completed'}")
+
+    # Glue's GetJobRun response does not contain the ETL's extracted/loaded row
+    # counts. Do not invent counts or estimate data volume from Glue runtime data.
+    st.caption("Record counts and bytes transferred are not currently returned to Streamlit by this Glue job.")
+    if details.get("error_message"):
+        st.error(f"Glue error: {details['error_message']}")
+
+    report_row = {
+        "source": "SAP OData",
+        "glue_job_name": st.session_state.get("sap_glue_job_name", ""),
+        "glue_job_run_id": run_id or "",
+        "status": status,
+        "entity_set": run_config.get("entity_set", ""),
+        "load_type": run_config.get("load_type", ""),
+        "output_format": run_config.get("output_format", ""),
+        "s3_destination": run_config.get("s3_base_path", ""),
+        "region": run_config.get("region", ""),
+        "started_on": started or "",
+        "completed_on": completed or "",
+        "duration_seconds": duration if duration is not None else "",
+        "dpu_seconds": details.get("dpu_seconds", ""),
+        "worker_type": details.get("worker_type", ""),
+        "number_of_workers": details.get("number_of_workers", ""),
+        "rows_migrated": "Not returned by Glue status API",
+        "bytes_migrated": "Not returned by Glue status API",
+        "error": details.get("error_message") or "",
+        "report_generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    csv_df = pd.DataFrame([report_row])
+    st.download_button(
+        "📥 Download SAP Glue CSV Report",
+        data=csv_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"sap_glue_migration_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        key="btn_download_sap_glue_report",
+    )
+    return True
+
+
 # ── Main render entry point ───────────────────────────────────────────────────
 def render_metrics_tab(s3_bucket: str = ""):
-    """
-    Full metrics & report tab renderer.
-    Replaces the old Tab 3 content in the main script.
-
-    Parameters
-    ----------
-    s3_bucket : str — passed in from sidebar input for COPY statement generation
-    """
-    queue   = st.session_state.get("job_queue", [])
+    """Render generic migration metrics plus the independent SAP Glue report."""
+    queue = st.session_state.get("job_queue", [])
     summary = st.session_state.get("migration_summary", {})
 
-    if not queue:
+    sap_has_run = _render_sap_glue_metrics()
+    if sap_has_run:
+        st.markdown("---")
+
+    if queue:
+        if summary:
+            _render_aggregate_metrics(summary)
+        else:
+            st.markdown(
+                '<span class="badge badge-pending">⚠ Run migration to see metrics</span>',
+                unsafe_allow_html=True,
+            )
+        _render_per_table_breakdown(queue)
+        _render_schema_chart(queue)
+        _render_export(queue, summary)
+        _render_copy_statements(queue, s3_bucket)
+    elif not sap_has_run:
         st.info("No migration data yet. Complete Table Discovery and run the pipeline first.")
-        return
 
-    # Aggregate metrics — only show if migration has run
-    if summary:
-        _render_aggregate_metrics(summary)
-    else:
-        st.markdown(
-            '<span class="badge badge-pending">⚠ Run migration to see metrics</span>',
-            unsafe_allow_html=True,
-        )
-
-    # Per-table breakdown
-    _render_per_table_breakdown(queue)
-
-    # Schema chart
-    _render_schema_chart(queue)
-
-    # Export
-    _render_export(queue, summary)
-
-    # COPY statements
-    _render_copy_statements(queue, s3_bucket)
-
-    # Operation log
+    # Operation log remains available even when only SAP Glue was run.
     st.markdown("---")
     st.markdown('<div class="card-title">🖥 Operation Log</div>', unsafe_allow_html=True)
     col_log, col_logbtn = st.columns([5, 1])

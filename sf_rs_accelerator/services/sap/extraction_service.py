@@ -8,12 +8,12 @@ def start_sap_glue_job(
     aws_access_key,
     aws_secret_key,
     s3_base_path,
-    aws_session_token=None,
     region="ap-south-1",
     page_size=1000,
     load_type="FULL",
     write_mode="overwrite",
     output_format="parquet",
+    aws_session_token=None,
 ):
     """Start the SAP OData-to-S3 Glue job using credentials supplied by the UI."""
 
@@ -41,8 +41,6 @@ def start_sap_glue_job(
         raise ValueError("AWS Access Key ID is required.")
     if not aws_secret_key or not aws_secret_key.strip():
         raise ValueError("AWS Secret Access Key is required.")
-    if aws_access_key.strip().startswith("ASIA") and not (aws_session_token or "").strip():
-        raise ValueError("AWS Session Token is required when using temporary credentials beginning with ASIA.")
     if not region or not region.strip():
         raise ValueError("AWS Region is required.")
 
@@ -66,7 +64,7 @@ def start_sap_glue_job(
         region_name=region.strip(),
         aws_access_key_id=aws_access_key.strip(),
         aws_secret_access_key=aws_secret_key.strip(),
-        **({"aws_session_token": aws_session_token.strip()} if (aws_session_token or "").strip() else {}),
+        **({"aws_session_token": aws_session_token.strip()} if aws_session_token and aws_session_token.strip() else {}),
     )
 
     # These names must match the arguments resolved by the existing Glue script.
@@ -96,22 +94,20 @@ def get_sap_glue_job_status(
     job_run_id,
     aws_access_key,
     aws_secret_key,
-    aws_session_token=None,
     region="ap-south-1",
+    aws_session_token=None,
 ):
     if not glue_job_name or not job_run_id:
         raise ValueError("Glue job name and job run ID are required to check status.")
     if not aws_access_key or not aws_secret_key:
         raise ValueError("AWS credentials are required to check Glue job status.")
-    if aws_access_key.strip().startswith("ASIA") and not (aws_session_token or "").strip():
-        raise ValueError("AWS Session Token is required when using temporary credentials beginning with ASIA.")
 
     glue_client = boto3.client(
         "glue",
         region_name=region,
         aws_access_key_id=aws_access_key.strip(),
         aws_secret_access_key=aws_secret_key.strip(),
-        **({"aws_session_token": aws_session_token.strip()} if (aws_session_token or "").strip() else {}),
+        **({"aws_session_token": aws_session_token.strip()} if aws_session_token and aws_session_token.strip() else {}),
     )
     response = glue_client.get_job_run(
         JobName=glue_job_name.strip(),
@@ -125,4 +121,10 @@ def get_sap_glue_job_status(
         "started_on": job_run.get("StartedOn"),
         "completed_on": job_run.get("CompletedOn"),
         "error_message": job_run.get("ErrorMessage"),
+        "execution_time": job_run.get("ExecutionTime"),
+        "dpu_seconds": job_run.get("DPUSeconds"),
+        "worker_type": job_run.get("WorkerType"),
+        "number_of_workers": job_run.get("NumberOfWorkers"),
+        "max_capacity": job_run.get("MaxCapacity"),
+        "execution_class": job_run.get("ExecutionClass"),
     }

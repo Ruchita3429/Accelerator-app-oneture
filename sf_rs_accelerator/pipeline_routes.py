@@ -6,8 +6,14 @@ BQ_REDSHIFT = "GCP (BigQuery) → S3 → Redshift"
 BQ_S3 = "GCP (BigQuery) → S3 only"
 DB_REDSHIFT = "Databricks → S3 → Redshift"
 DB_S3 = "Databricks → S3 only"
+SAP_REDSHIFT = "SAP → S3 → Redshift"
 SAP_S3 = "SAP → S3 only"
-ROUTES = [SF_REDSHIFT, SF_S3, BQ_REDSHIFT, BQ_S3, DB_REDSHIFT, DB_S3, SAP_S3]
+ROUTES = [
+    SF_REDSHIFT, SF_S3,
+    BQ_REDSHIFT, BQ_S3,
+    DB_REDSHIFT, DB_S3,
+    SAP_REDSHIFT, SAP_S3,
+]
 
 
 def resolve_route(destination, source_type="Snowflake"):
@@ -18,7 +24,7 @@ def resolve_route(destination, source_type="Snowflake"):
     routes = {"snowflake": (SF_REDSHIFT, SF_S3),
               "databricks": (DB_REDSHIFT, DB_S3),
               "bigquery": (BQ_REDSHIFT, BQ_S3),
-              "sap": (SAP_S3, SAP_S3)}
+              "sap": (SAP_REDSHIFT, SAP_S3)}
     if source not in routes or destination not in ("Source → S3 → Redshift", "Source → S3 only"):
         raise ValueError("Unknown pipeline source or destination. Select a supported route.")
     return routes[source][destination == "Source → S3 only"]
@@ -33,7 +39,7 @@ def s3_only(route):
 
 
 def formats_for(route):
-    return ["Parquet", "JSON", "ORC"] if route == BQ_REDSHIFT else ["Iceberg", "Parquet", "JSON", "ORC"]
+    return ["Parquet", "JSON", "ORC"] if route in (BQ_REDSHIFT, SAP_REDSHIFT) else ["Iceberg", "Parquet", "JSON", "ORC"]
 
 
 def source_name(job):

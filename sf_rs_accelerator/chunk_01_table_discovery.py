@@ -308,6 +308,63 @@ def render_table_discovery(
         from bigquery_ui import render_discovery
         render_discovery(kwargs.get("s3_cfg", {}), kwargs.get("rs_cfg", {}))
         return
+
+    # SAP has its own OData discovery and AWS Glue execution flow.
+    # Keep it separate from the schema/table queue used by Snowflake and Databricks.
+    if _active_src == "SAP":
+        st.markdown("---")
+        st.markdown('<div class="card-title">🗂 SAP OData Entity Discovery</div>', unsafe_allow_html=True)
+
+        if not st.session_state.get("sap_connected", False):
+            st.info("Connect to SAP in the sidebar to view available OData entity sets.")
+            return
+
+        entity_sets = st.session_state.get("sap_entity_sets", []) or []
+        entity_names = [
+            item.get("name", "") if isinstance(item, dict) else str(item)
+            for item in entity_sets
+        ]
+        entity_names = [name for name in entity_names if name]
+
+        if not entity_names:
+            st.warning("The connected SAP service did not return any OData entity sets.")
+            return
+
+        st.success(f"SAP connected · {len(entity_names)} OData entity set(s) available")
+
+        # The SAP entity selector already exists in the sidebar. Reuse its
+        # session-state value here instead of creating a second selector.
+        selected_entity = st.session_state.get("sap_selected_entity")
+        if selected_entity not in entity_names:
+            selected_entity = entity_names[0]
+            st.session_state.sap_selected_entity = selected_entity
+
+        st.write(f"**Selected OData Entity Set:** `{selected_entity}`")
+
+        metadata_root = st.session_state.get("sap_metadata")
+        if metadata_root is None:
+            st.warning("SAP metadata is not available in the current session. Reconnect to SAP to retrieve it.")
+            return
+
+        try:
+            from connectors.sap.metadata import get_sap_entity_columns
+            columns = get_sap_entity_columns(metadata_root, selected_entity)
+        except Exception as exc:
+            st.error(f"Could not read columns for {selected_entity}: {exc}")
+            return
+
+        st.markdown(f"**Entity:** `{selected_entity}`")
+        if columns:
+            import pandas as pd
+            columns_df = pd.DataFrame(columns)
+            st.caption(f"{len(columns)} column(s) found in the SAP metadata.")
+            st.dataframe(columns_df, use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No property definitions were found for `{selected_entity}` in the loaded metadata.")
+
+        st.caption("This discovery view reuses the existing SAP connection and metadata. Migration continues through the existing AWS Glue workflow; no generic Snowflake/Databricks queue is created here.")
+        return
+
     is_db = (_active_src == "Databricks")
     source_name = "Databricks" if is_db else "Snowflake"
     is_connected = st.session_state.get("db_connected", False) if is_db else st.session_state.get("sf_connected", False)

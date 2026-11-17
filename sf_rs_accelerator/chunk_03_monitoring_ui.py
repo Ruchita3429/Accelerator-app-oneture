@@ -26,6 +26,7 @@ SESSION STATE KEYS READ
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from html import escape
 
 
 def _format_bytes(b: int) -> str:
@@ -220,8 +221,82 @@ def render_monitoring_tab():
 
     st.markdown('<div class="card-title">📡 Migration Monitor</div>', unsafe_allow_html=True)
 
+    # SAP runs through AWS Glue independently of the generic table job queue.
+    # Read the existing session state populated by the SAP migration workflow.
+    sap_status = st.session_state.get("sap_glue_job_status", "NOT_STARTED")
+    sap_run_id = st.session_state.get("sap_glue_job_run_id")
+    sap_job_name = st.session_state.get("sap_glue_job_name", "")
+    sap_details = st.session_state.get("sap_glue_job_details", {}) or {}
+    sap_entity = st.session_state.get("sap_selected_entity")
+    sap_source_selected = st.session_state.get("source_type") == "SAP"
+
+    if sap_source_selected or sap_run_id or sap_status != "NOT_STARTED":
+        st.markdown('<div class="card-title">🟠 SAP Glue Migration</div>', unsafe_allow_html=True)
+
+        status_labels = {
+            "NOT_STARTED": "Not started",
+            "STARTING": "Starting",
+            "WAITING": "Waiting",
+            "RUNNING": "Running",
+            "STOPPING": "Stopping",
+            "STOPPED": "Stopped",
+            "SUCCEEDED": "Succeeded",
+            "FAILED": "Failed",
+            "TIMEOUT": "Timed out",
+            "ERROR": "Error",
+            "START_FAILED": "Start failed",
+        }
+        status_label = status_labels.get(sap_status, str(sap_status))
+        if sap_status == "SUCCEEDED":
+            st.success(f"SAP Glue job: {status_label}")
+        elif sap_status in ("FAILED", "TIMEOUT", "ERROR", "START_FAILED", "STOPPED"):
+            st.error(f"SAP Glue job: {status_label}")
+        elif sap_status in ("STARTING", "WAITING", "RUNNING", "STOPPING"):
+            st.info(f"SAP Glue job: {status_label}")
+        else:
+            st.caption(f"SAP Glue job: {status_label}")
+
+        # Use compact cards instead of st.metric: Streamlit renders metric values
+        # with oversized typography, which makes long Glue job names look abnormal.
+        job_name_html = escape(str(sap_job_name or "—"))
+        entity_html = escape(str(sap_entity or "—"))
+        run_state_html = "Available" if sap_run_id else "—"
+        st.markdown(
+            f"""
+            <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:18px 0 14px;">
+              <div style="min-width:0;padding:14px 16px;border:1px solid rgba(128,128,128,.28);border-radius:10px;background:rgba(128,128,128,.045);">
+                <div style="font-size:13px;font-weight:600;opacity:.72;margin-bottom:7px;">Glue Job</div>
+                <div style="font-size:18px;line-height:1.35;font-weight:600;overflow-wrap:anywhere;">{job_name_html}</div>
+              </div>
+              <div style="min-width:0;padding:14px 16px;border:1px solid rgba(128,128,128,.28);border-radius:10px;background:rgba(128,128,128,.045);">
+                <div style="font-size:13px;font-weight:600;opacity:.72;margin-bottom:7px;">Entity Set</div>
+                <div style="font-size:18px;line-height:1.35;font-weight:600;overflow-wrap:anywhere;">{entity_html}</div>
+              </div>
+              <div style="min-width:0;padding:14px 16px;border:1px solid rgba(128,128,128,.28);border-radius:10px;background:rgba(128,128,128,.045);">
+                <div style="font-size:13px;font-weight:600;opacity:.72;margin-bottom:7px;">Run ID</div>
+                <div style="font-size:18px;line-height:1.35;font-weight:600;">{run_state_html}</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if sap_run_id:
+            st.caption(f"Glue Job Run ID: `{sap_run_id}`")
+        if sap_details.get("started_on"):
+            st.write(f"**Started:** {sap_details['started_on']}")
+        if sap_details.get("completed_on"):
+            st.write(f"**Completed:** {sap_details['completed_on']}")
+        if sap_details.get("error_message"):
+            st.error(sap_details["error_message"])
+        elif sap_status == "SUCCEEDED":
+            st.success("AWS Glue reported that the SAP extraction completed successfully.")
+
+        st.caption("To retrieve the latest AWS Glue status, use **Refresh Glue Job Status** in the SAP migration section.")
+        st.markdown("---")
+
     if not queue:
-        st.info("No migration queued yet. Complete Table Discovery first.")
+        st.info("No table migration queue is available. SAP Glue status is shown above when applicable.")
         return
 
     if running:
