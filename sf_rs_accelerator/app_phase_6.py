@@ -116,6 +116,7 @@ def init_state():
         "sap_glue_job_run_id": None,
         "sap_glue_job_status": "NOT_STARTED",
         "sap_glue_job_details": {},
+        "sap_glue_run_config": {},
         # ── BigQuery connection ───────────────────────────────────────────────
         "bq_connected": False,
         "bq_client": None,
@@ -562,6 +563,7 @@ def _rs_data_api_client(cfg):
         region_name=cfg.get("region", "ap-south-1"),
         aws_access_key_id=cfg.get("access_key"),
         aws_secret_access_key=cfg.get("secret_key"),
+        aws_session_token=cfg.get("session_token") or None,
     )
 
 def _rs_run_sql(cfg, sql, timeout=60):
@@ -739,10 +741,6 @@ with st.sidebar:
     if _src_sel != st.session_state.get("source_type"):
         reset_queue(st.session_state)
         st.session_state["source_type"] = _src_sel
-        # SAP currently writes through AWS Glue to S3; Redshift routing is not
-        # part of the SAP migration path, so select the supported S3-only route.
-        if _src_sel == "SAP":
-            st.session_state["pipeline_destination"] = "Source → S3 only"
         # reset connection state when switching sources
         st.session_state.sf_connected    = False
         st.session_state.db_connected    = False
@@ -1092,7 +1090,14 @@ with st.sidebar:
 
     if st.button("Connect Redshift", key="btn_rs_connect"):
         with st.spinner("Connecting…"):
-            cfg = {"workgroup": rs_workgroup, "database": rs_db, "region": rs_region, "access_key": s3_access_key, "secret_key": s3_secret_key}
+            cfg = {
+                "workgroup": rs_workgroup,
+                "database": rs_db,
+                "region": rs_region,
+                "access_key": s3_access_key,
+                "secret_key": s3_secret_key,
+                "session_token": s3_session_token,
+            }
             try:
                 # Strip full endpoint URL if pasted — extract just workgroup name
                 cfg["workgroup"] = cfg["workgroup"].split(".")[0].strip()
@@ -1172,6 +1177,7 @@ _rs_cfg = {
     "region":     (rs_region or "").strip(),
     "access_key": (s3_access_key or "").strip(),
     "secret_key": (s3_secret_key or "").strip(),
+    "session_token": (s3_session_token or "").strip(),
 }
 
 
@@ -1196,9 +1202,6 @@ with _dest_col:
         st.rerun()
 
 _dest_mode = st.session_state.get("pipeline_destination", "Source → S3 → Redshift")
-if _source_type == "SAP" and _dest_mode != "Source → S3 only":
-    _dest_mode = "Source → S3 only"
-    st.session_state["pipeline_destination"] = _dest_mode
 _s3_only = s3_only(resolve_route(_dest_mode, _source_type))
 
 with _dest_info_col:
@@ -1212,7 +1215,7 @@ with _dest_info_col:
     else:
         st.markdown(
             '<span class="badge badge-connected" style="margin-top:28px;display:inline-flex">'
-            '● Full pipeline — Snowflake → S3 → Redshift'
+            f'● Full pipeline — {_source_type} → S3 → Redshift'
             '</span>',
             unsafe_allow_html=True,
         )
@@ -1407,8 +1410,16 @@ with tab_discovery, tab_loading():
 # ─────────────────────────────────────────────────────────────────────────────
 with tab1, tab_loading():
     if _source_type == "SAP":
-        st.markdown("### SAP OData → Amazon S3")
-        st.info("SAP extraction runs in AWS Glue. Streamlit only submits the job and monitors its status.")
+        st.markdown(
+            "### SAP OData → Amazon S3 → Redshift"
+            if not _s3_only else "### SAP OData → Amazon S3"
+        )
+        st.info(
+            "SAP extraction runs in AWS Glue and writes Parquet data to the S3 staging layer. "
+            "The Redshift load is a separate pipeline step."
+            if not _s3_only else
+            "SAP extraction runs in AWS Glue. Streamlit submits the job and monitors its status; S3 is the final destination."
+        )
 
         _sap_cfg_for_job = st.session_state.get("sap_config", {})
         # Only a real entity selected from metadata is eligible for migration.
@@ -1534,6 +1545,14 @@ with tab1, tab_loading():
                         output_format=sap_output_format,
                     )
                 st.session_state.sap_glue_job_run_id = _run_id
+                st.session_state.sap_glue_run_config = {
+                    "entity_set": _sap_entity_for_job,
+                    "load_type": sap_load_type,
+                    "page_size": int(sap_page_size_job),
+                    "output_format": sap_output_format,
+                    "s3_base_path": _sap_s3_base_path,
+                    "region": _s3_cfg["region"],
+                }
                 # The text_input widget already owns this session-state key.
                 # Do not assign to it after the widget has been instantiated.
                 st.session_state.sap_glue_job_status = "STARTING"
@@ -1627,10 +1646,22 @@ with tab1, tab_loading():
             else:
                 sf_table_opts = []
 
+            # Databricks may have a different table list from the previously
+            # selected source/schema. Keep only defaults that exist in the
+            # current Databricks options to prevent Streamlit's
+            # StreamlitDefaultNotInOptionsError.
+            _saved_table_selection = st.session_state.get("sf_tables_selected", [])
+            if _source_type == "Databricks":
+                _table_multiselect_default = [
+                    table for table in _saved_table_selection if table in sf_table_opts
+                ]
+            else:
+                _table_multiselect_default = _saved_table_selection
+
             sf_tables_selected = st.multiselect(
                 "Tables  (select one or more)",
                 options=sf_table_opts,
-                default=st.session_state.get("sf_tables_selected", []),
+                default=_table_multiselect_default,
                 placeholder="Choose tables…",
                 key="sf_table_multisel",
             )
@@ -1844,11 +1875,16 @@ with tab1, tab_loading():
                                 fname += ".gz"
 
                         # Upload to S3
+                        _databricks_s3_auth = {}
+                        if _source_type == "Databricks":
+                            _databricks_s3_auth["aws_session_token"] = _s3_cfg.get("session_token") or None
+
                         s3_client = boto3.client(
                             "s3",
                             aws_access_key_id=_s3_cfg["access_key"],
                             aws_secret_access_key=_s3_cfg["secret_key"],
                             region_name=_s3_cfg["region"],
+                            **_databricks_s3_auth,
                         )
                         s3_key = f"{_s3_cfg['prefix'].rstrip('/')}/{sf_schema}/{fname}"
                         s3_client.put_object(Bucket=_s3_cfg["bucket"], Key=s3_key, Body=body)
@@ -1911,7 +1947,7 @@ def _detect_fmt(key: str) -> str:
             return fmt
     return "Unknown"
 
-def _s3_list_prefix(bucket, prefix, access_key, secret_key, region):
+def _s3_list_prefix(bucket, prefix, access_key, secret_key, region, session_token=None):
     """
     List one level of an S3 prefix — returns:
       folders: list of prefix strings (common prefixes / virtual directories)
@@ -1920,8 +1956,13 @@ def _s3_list_prefix(bucket, prefix, access_key, secret_key, region):
     """
     try:
         import boto3
-        s3 = boto3.client("s3", aws_access_key_id=access_key,
-                          aws_secret_access_key=secret_key, region_name=region)
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            aws_session_token=session_token or None,
+            region_name=region,
+        )
         resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter="/")
         folders = [cp["Prefix"] for cp in resp.get("CommonPrefixes", [])]
         files   = [
@@ -1946,11 +1987,16 @@ def _rs_get_table_columns(rs_cfg, schema, table):
     except Exception:
         return None
 
-def _peek_file_columns(bucket, key, fmt, access_key, secret_key, region):
+def _peek_file_columns(bucket, key, fmt, access_key, secret_key, region, session_token=None):
     try:
         import boto3, io, csv as _csv
-        s3 = boto3.client("s3", aws_access_key_id=access_key,
-                          aws_secret_access_key=secret_key, region_name=region)
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            aws_session_token=session_token or None,
+            region_name=region,
+        )
         if fmt == "Parquet":
             import pandas as pd
             raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
@@ -1973,34 +2019,148 @@ def _peek_file_columns(bucket, key, fmt, access_key, secret_key, region):
     except Exception:
         return []
 
+
+def _peek_parquet_schema(bucket, key, access_key, secret_key, region, session_token=None):
+    """Return ordered (column_name, Redshift SQL type) pairs from an S3 Parquet file."""
+    import boto3
+    import io
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        aws_session_token=session_token or None,
+        region_name=region,
+    )
+    raw = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        parquet_schema = pq.read_schema(io.BytesIO(raw))
+    except ImportError:
+        # pandas is already used by the Parquet preview path; use it as a fallback
+        # if PyArrow is not separately importable in the Streamlit environment.
+        import pandas as pd
+        frame = pd.read_parquet(io.BytesIO(raw))
+        fields = []
+        for name, dtype in frame.dtypes.items():
+            dtype_name = str(dtype).lower()
+            if "bool" in dtype_name:
+                sql_type = "BOOLEAN"
+            elif "int" in dtype_name:
+                sql_type = "BIGINT" if "64" in dtype_name else "INTEGER"
+            elif "float" in dtype_name:
+                sql_type = "DOUBLE PRECISION"
+            elif "datetime" in dtype_name:
+                sql_type = "TIMESTAMP"
+            else:
+                sql_type = "VARCHAR(65535)"
+            fields.append((str(name), sql_type))
+        return fields
+
+    def _redshift_type(arrow_type):
+        if pa.types.is_dictionary(arrow_type):
+            arrow_type = arrow_type.value_type
+        if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+            return "VARCHAR(65535)"
+        if pa.types.is_boolean(arrow_type):
+            return "BOOLEAN"
+        if pa.types.is_int8(arrow_type) or pa.types.is_int16(arrow_type) or pa.types.is_int32(arrow_type):
+            return "INTEGER"
+        if pa.types.is_int64(arrow_type):
+            return "BIGINT"
+        if pa.types.is_uint8(arrow_type) or pa.types.is_uint16(arrow_type) or pa.types.is_uint32(arrow_type):
+            return "BIGINT"
+        if pa.types.is_uint64(arrow_type):
+            return "DECIMAL(20,0)"
+        if pa.types.is_float16(arrow_type) or pa.types.is_float32(arrow_type):
+            return "REAL"
+        if pa.types.is_float64(arrow_type):
+            return "DOUBLE PRECISION"
+        if pa.types.is_decimal(arrow_type):
+            if arrow_type.precision > 38:
+                raise ValueError(f"Parquet decimal precision {arrow_type.precision} exceeds Redshift's maximum of 38")
+            return f"DECIMAL({arrow_type.precision},{arrow_type.scale})"
+        if pa.types.is_date(arrow_type):
+            return "DATE"
+        if pa.types.is_timestamp(arrow_type):
+            return "TIMESTAMPTZ" if arrow_type.tz else "TIMESTAMP"
+        if pa.types.is_time(arrow_type):
+            return "TIME"
+        if pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type) or pa.types.is_fixed_size_binary(arrow_type):
+            return "VARBYTE"
+        if pa.types.is_null(arrow_type):
+            return "VARCHAR(65535)"
+        raise ValueError(f"Unsupported Parquet column type: {arrow_type}")
+
+    return [(field.name, _redshift_type(field.type)) for field in parquet_schema]
+
+
+def _create_redshift_table_from_parquet(rs_cfg, rs_schema, rs_table, s3_cfg, s3_key):
+    """Create a new Redshift table using the selected Parquet file's ordered schema."""
+    import re
+
+    table_name = (rs_table or "").strip().lower()
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", table_name):
+        raise ValueError("Table name must start with a letter or underscore and contain only letters, numbers, and underscores.")
+
+    columns = _peek_parquet_schema(
+        s3_cfg["bucket"], s3_key,
+        s3_cfg["access_key"], s3_cfg["secret_key"], s3_cfg["region"],
+        s3_cfg.get("session_token"),
+    )
+    if not columns:
+        raise ValueError("Could not read any columns from the selected Parquet file.")
+
+    def _quote_identifier(value):
+        return '"' + str(value).replace('"', '""') + '"'
+
+    column_definitions = []
+    for column_name, redshift_type in columns:
+        column_definitions.append(f"    {_quote_identifier(column_name)} {redshift_type}")
+
+    create_sql = (
+        f"CREATE TABLE {_quote_identifier(rs_schema)}.{_quote_identifier(table_name)} (\n"
+        + ",\n".join(column_definitions)
+        + "\n)"
+    )
+    _rs_run_sql(rs_cfg, create_sql, timeout=60)
+    return table_name, [name for name, _ in columns]
+
 def _do_redshift_copy(rs_cfg, s3_cfg, s3_key, rs_schema, rs_table, fmt, load_mode,
                       rs_delimiter=",", rs_skip_header=1, rs_null_as="",
                       rs_encoding="UTF8", rs_date_fmt="YYYY-MM-DD",
                       rs_max_error=10, rs_compupdate=True, rs_statupdate=True):
     s3_uri = f"s3://{s3_cfg['bucket']}/{s3_key}"
-    ak, sk  = s3_cfg["access_key"], s3_cfg["secret_key"]
+    ak, sk = s3_cfg["access_key"], s3_cfg["secret_key"]
+    session_token = (s3_cfg.get("session_token") or "").strip()
+    copy_credentials = (
+        f"ACCESS_KEY_ID '{ak}' SECRET_ACCESS_KEY '{sk}' "
+        + (f"SESSION_TOKEN '{session_token}' " if session_token else "")
+    )
     if load_mode == "TRUNCATE & LOAD":
         _rs_run_sql(rs_cfg, f'TRUNCATE TABLE "{rs_schema}"."{rs_table}"', timeout=30)
     delim_map = {",  (comma)": ",", "|  (pipe)": "|", "\\t  (tab)": "\t", ";  (semicolon)": ";"}
     delim = delim_map.get(rs_delimiter, rs_delimiter)
     if fmt == "CSV":
         sql = f"""COPY "{rs_schema}"."{rs_table}" FROM '{s3_uri}'
-            ACCESS_KEY_ID '{ak}' SECRET_ACCESS_KEY '{sk}'
+            {copy_credentials}
             FORMAT AS CSV DELIMITER '{delim}' QUOTE '"' IGNOREHEADER {rs_skip_header}
             NULL AS '{rs_null_as}' ENCODING {rs_encoding} DATEFORMAT '{rs_date_fmt}'
             MAXERROR {rs_max_error} {"COMPUPDATE ON" if rs_compupdate else "COMPUPDATE OFF"}
             {"STATUPDATE ON" if rs_statupdate else "STATUPDATE OFF"} TIMEFORMAT 'auto'"""
     elif fmt == "Parquet":
         sql = f"""COPY "{rs_schema}"."{rs_table}" FROM '{s3_uri}'
-            ACCESS_KEY_ID '{ak}' SECRET_ACCESS_KEY '{sk}'
+            {copy_credentials}
             FORMAT AS PARQUET MAXERROR {rs_max_error}"""
     elif fmt == "ORC":
         sql = f"""COPY "{rs_schema}"."{rs_table}" FROM '{s3_uri}'
-            ACCESS_KEY_ID '{ak}' SECRET_ACCESS_KEY '{sk}'
+            {copy_credentials}
             FORMAT AS ORC MAXERROR {rs_max_error}"""
     else:
         sql = f"""COPY "{rs_schema}"."{rs_table}" FROM '{s3_uri}'
-            ACCESS_KEY_ID '{ak}' SECRET_ACCESS_KEY '{sk}'
+            {copy_credentials}
             FORMAT AS JSON 'auto' MAXERROR {rs_max_error}
             {"COMPUPDATE ON" if rs_compupdate else "COMPUPDATE OFF"}"""
     _rs_run_sql(rs_cfg, sql.strip(), timeout=300)
@@ -2041,7 +2201,7 @@ with tab2, tab_loading():
                     current_prefix = st.session_state.get("t2_browser_prefix", "")
                     with st.spinner(f"Listing s3://{bucket_to_use}/{current_prefix} …"):
                         res = _s3_list_prefix(bucket_to_use, current_prefix,
-                                              s3_access_key, s3_secret_key, s3_region)
+                                              s3_access_key, s3_secret_key, s3_region, s3_session_token)
                     if isinstance(res, Exception):
                         st.error(f"Cannot access bucket: {res}")
                     else:
@@ -2084,7 +2244,7 @@ with tab2, tab_loading():
                         with st.spinner(f"Opening {chosen_folder}/ …"):
                             res2 = _s3_list_prefix(
                                 st.session_state["t2_bucket_val"], selected_full,
-                                s3_access_key, s3_secret_key, s3_region,
+                                s3_access_key, s3_secret_key, s3_region, s3_session_token,
                             )
                         if isinstance(res2, Exception):
                             st.error(str(res2))
@@ -2162,6 +2322,7 @@ with tab2, tab_loading():
                 "region":    rs_region,
                 "access_key": s3_access_key,
                 "secret_key": s3_secret_key,
+                "session_token": s3_session_token,
             }
 
             # ── Schema selector ───────────────────────────────────────────────────
@@ -2246,12 +2407,33 @@ with tab2, tab_loading():
                     "bucket":     st.session_state.get("t2_bucket_val", t2_bucket),
                     "access_key": s3_access_key,
                     "secret_key": s3_secret_key,
+                    "session_token": s3_session_token,
                     "region":     s3_region,
                 }
 
-                # Fetch RS columns once for validation
+                # Create the target table from the selected Parquet schema when requested.
+                if t2_target_mode == "New table name":
+                    try:
+                        if not t2_selected_entries or t2_selected_entries[0][2] != "Parquet":
+                            raise ValueError("Automatic table creation currently supports Parquet files only.")
+                        t2_rs_table, _created_cols = _create_redshift_table_from_parquet(
+                            _rscfg_load, t2_rs_schema, t2_rs_table, _s3cfg_load,
+                            t2_selected_entries[0][0],
+                        )
+                        st.success(f"Created Redshift table {t2_rs_schema}.{t2_rs_table} from the Parquet schema.")
+                        # Refresh the cached table list so the new table appears in the selector next time.
+                        st.session_state.pop(f"_t2_tbls_{t2_rs_schema}", None)
+                    except Exception as create_err:
+                        st.error(f"Could not create Redshift table: {create_err}")
+                        st.stop()
+
+                # Fetch RS columns once for validation. A newly created table now exists
+                # before TRUNCATE/COPY is attempted.
                 rs_cols = _rs_get_table_columns(_rscfg_load, t2_rs_schema, t2_rs_table)
-                rs_cols_lower = {c.lower() for c in rs_cols} if rs_cols else None
+                if rs_cols is None:
+                    st.error(f"Could not read columns for Redshift table {t2_rs_schema}.{t2_rs_table}.")
+                    st.stop()
+                rs_cols_lower = {c.lower() for c in rs_cols}
 
                 skipped, succeeded, failed = [], [], []
                 progress_bar = st.progress(0, text="Starting…")
@@ -2264,7 +2446,7 @@ with tab2, tab_loading():
                     if rs_cols_lower is not None:
                         file_cols = _peek_file_columns(
                             _s3cfg_load["bucket"], s3_key, file_fmt,
-                            s3_access_key, s3_secret_key, s3_region,
+                            s3_access_key, s3_secret_key, s3_region, s3_session_token,
                         )
                         if file_cols:
                             fcl = {c.lower() for c in file_cols}
@@ -3549,6 +3731,8 @@ with tab_hc, tab_loading():
             if _hc_src == "BigQuery"
             else "cluster metrics, query performance, storage, jobs, security and more."
             if _hc_src == "Databricks"
+            else "OAuth connectivity, OData metadata, available entity sets and Glue job status."
+            if _hc_src == "SAP"
             else "warehouse load, query performance, security, pipeline health and more."
         )
     )
@@ -3583,6 +3767,83 @@ with tab_hc, tab_loading():
             st.markdown("---")
             # Render the BigQuery health check client-run kit UI
             _bq_render_health()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SAP path — reuse the existing sidebar connection and loaded OData metadata
+    # ══════════════════════════════════════════════════════════════════════════
+    elif _hc_src == "SAP":
+        _sap_hc_cfg = st.session_state.get("sap_config", {}) or {}
+        _sap_hc_connected = bool(st.session_state.get("sap_connected", False))
+        _sap_hc_metadata = st.session_state.get("sap_metadata")
+        _sap_hc_entities = st.session_state.get("sap_entity_sets", []) or []
+        _sap_hc_selected = st.session_state.get("sap_selected_entity")
+
+        hc_sap_col, hc_sap_status_col = st.columns([4, 1])
+        with hc_sap_col:
+            st.markdown("**SAP OData Connection**")
+            st.caption("Uses the SAP OAuth connection established from the sidebar.")
+        with hc_sap_status_col:
+            if _sap_hc_connected:
+                st.success("Connected")
+            else:
+                st.error("Disconnected")
+
+        st.markdown("---")
+        st.markdown("#### Connection diagnostics")
+        _sap_hc_checks = [
+            ("SAP connection", _sap_hc_connected,
+             "The sidebar connection test completed successfully." if _sap_hc_connected
+             else st.session_state.get("sap_connect_error") or "Connect to SAP from the sidebar."),
+            ("OAuth configuration", bool(_sap_hc_cfg.get("token_url") and _sap_hc_cfg.get("client_id") and _sap_hc_cfg.get("client_secret")),
+             "Required OAuth fields are configured." if all(_sap_hc_cfg.get(k) for k in ("token_url", "client_id", "client_secret"))
+             else "One or more OAuth configuration fields are missing."),
+            ("OData service URL", bool(_sap_hc_cfg.get("odata_base_url")),
+             "OData service URL is configured." if _sap_hc_cfg.get("odata_base_url") else "OData service URL is missing."),
+            ("OData metadata", _sap_hc_metadata is not None,
+             "Service metadata is loaded." if _sap_hc_metadata is not None else "Metadata is unavailable; reconnect to SAP."),
+            ("Entity sets", bool(_sap_hc_entities),
+             f"{len(_sap_hc_entities)} entity set(s) discovered." if _sap_hc_entities else "No entity sets were discovered."),
+        ]
+        for _check_name, _check_ok, _check_detail in _sap_hc_checks:
+            _badge = "🟢 PASS" if _check_ok else "🔴 FAIL"
+            st.markdown(f"**{_badge} — {_check_name}**  ")
+            st.caption(_check_detail)
+
+        _sap_hc_passed = sum(1 for _, ok, _ in _sap_hc_checks if ok)
+        _sap_hc_total = len(_sap_hc_checks)
+        st.metric("SAP Health Checks Passed", f"{_sap_hc_passed}/{_sap_hc_total}")
+
+        st.markdown("---")
+        st.markdown("#### Discovered OData entity sets")
+        if _sap_hc_entities:
+            _sap_hc_rows = []
+            for _entity in _sap_hc_entities:
+                if isinstance(_entity, dict):
+                    _sap_hc_rows.append({
+                        "Entity Set": _entity.get("name", ""),
+                        "Entity Type": _entity.get("entity_type", "Not available"),
+                    })
+                else:
+                    _sap_hc_rows.append({"Entity Set": str(_entity), "Entity Type": "Not available"})
+            st.dataframe(pd.DataFrame(_sap_hc_rows), use_container_width=True, hide_index=True)
+            st.caption(f"Selected entity: `{_sap_hc_selected or 'None selected'}`")
+        else:
+            st.info("No OData entity sets are available. Connect to SAP from the sidebar to load metadata.")
+
+        st.markdown("---")
+        st.markdown("#### AWS Glue extraction status")
+        _sap_hc_glue_status = st.session_state.get("sap_glue_job_status", "NOT_STARTED")
+        _sap_hc_glue_run_id = st.session_state.get("sap_glue_job_run_id")
+        if _sap_hc_glue_status == "SUCCEEDED":
+            st.success(f"Latest Glue job: {_sap_hc_glue_status}")
+        elif _sap_hc_glue_status in ("FAILED", "TIMEOUT", "ERROR", "START_FAILED", "STOPPED"):
+            st.error(f"Latest Glue job: {_sap_hc_glue_status}")
+        elif _sap_hc_glue_status in ("STARTING", "WAITING", "RUNNING", "STOPPING"):
+            st.info(f"Latest Glue job: {_sap_hc_glue_status}")
+        else:
+            st.caption("No Glue extraction has been submitted in this session yet.")
+        if _sap_hc_glue_run_id:
+            st.code(_sap_hc_glue_run_id, language=None)
 
     # ══════════════════════════════════════════════════════════════════════════
     # SNOWFLAKE path

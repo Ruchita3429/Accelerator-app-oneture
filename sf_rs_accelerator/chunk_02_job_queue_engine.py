@@ -409,6 +409,7 @@ def _extract_databricks_to_s3(job: dict, db_cfg: dict, s3_cfg: dict) -> dict:
         "s3",
         aws_access_key_id=s3_cfg["access_key"],
         aws_secret_access_key=s3_cfg["secret_key"],
+        aws_session_token=s3_cfg.get("session_token") or None,
         region_name=s3_cfg["region"],
     )
     s3_client.put_object(
